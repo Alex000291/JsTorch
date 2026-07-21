@@ -1,0 +1,24 @@
+{
+  "name": "@alex000291/jstorch",
+  "version": "1.0.0",
+  "description": "A javascript version of pytorch",
+  "homepage": "https://github.com/Alex000291/JsTorch#readme",
+  "bugs": {
+    "url": "https://github.com/Alex000291/JsTorch/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Alex000291/JsTorch.git"
+  },
+  "license": "ISC",
+  "author": "Alex000291",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.9.0",
+    "node-api-headers": "^1.9.0"
+  }
+}
