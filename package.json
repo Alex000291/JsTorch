@@ -1,8 +1,9 @@
 {
   "name": "@alex000291/jstorch",
-  "version": "1.0.0",
-  "description": "A javascript version of pytorch",
+  "version": "0.1.0",
+  "description": "A JavaScript version of PyTorch with CUDA acceleration",
   "homepage": "https://github.com/Alex000291/JsTorch#readme",
+  "types": "src/index.d.ts",
   "bugs": {
     "url": "https://github.com/Alex000291/JsTorch/issues"
   },
@@ -10,15 +11,44 @@
     "type": "git",
     "url": "git+https://github.com/Alex000291/JsTorch.git"
   },
-  "license": "ISC",
+  "license": "MIT",
   "author": "Alex000291",
   "type": "module",
   "main": "src/index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "exports": {
+    ".": "./src/index.js"
   },
+  "scripts": {
+    "build": "node Makefile.js",
+    "test": "node src/test1.js",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "src/",
+    "build/win/jstorch.node",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pytorch",
+    "tensor",
+    "cuda",
+    "gpu",
+    "machine-learning",
+    "deep-learning"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
   "dependencies": {
     "node-addon-api": "^8.9.0",
     "node-api-headers": "^1.9.0"
-  }
+  },
+  "devDependencies": {}
 }

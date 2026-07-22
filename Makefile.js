@@ -41,7 +41,10 @@ async function compile(vars) {
         console.log(`Compiling ${srcPath}...`);
         
         // Windows 使用 cl.exe (MSVC)，需要 C++17 标准（/std:c++17）
-        await exec(`cl /c "${srcPath}" /Fo"${objFile}" /std:c++17 /EHsc /MD /I"node_modules\\node-addon-api" /I"node_modules\\node-api-headers\\include"`);
+        const cudaPath = process.env.CUDA_PATH || 'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.4';
+        const cudaInclude = path.join(cudaPath, 'include');
+        
+        await exec(`cl /c "${srcPath}" /Fo"${objFile}" /std:c++20 /EHsc /MD /utf-8 /I"node_modules\\node-addon-api" /I"node_modules\\node-api-headers\\include" /I"${cudaInclude}"`);
         obj_files.push(objFile);
     }
 
@@ -53,10 +56,9 @@ async function compile(vars) {
     for (const element of cu_src_files) {
         const srcPath = path.join('native', element + '.cu');
         const objFile = path.join('native', 'cu_obj', path.basename(element) + '.obj');
-        console.log(`Compiling ${srcPath}...`);
+        console.log(`Compiling ${srcPath} for all architectures...`);
         
         // Windows 使用 nvcc + MSVC
-        // 使用 -Xcompiler /MD 匹配 C++ 的 runtime library
         const cleanEnv = {
             ...process.env,
             ...vars,
@@ -64,7 +66,15 @@ async function compile(vars) {
             TMP: process.env.TMP || 'C:\\Temp'
         };
         
-        await exec(`nvcc -c "${srcPath}" -o "${objFile}" -Xcompiler /MD`, {
+        // 编译所有架构到同一个 .obj 文件（类似 PyTorch）
+        // CUDA 13.4 支持的架构：sm_75 及以上
+        await exec(`nvcc -c "${srcPath}" -o "${objFile}" -Xcompiler /MD `
+            + `-gencode arch=compute_75,code=sm_75 `  // Turing: RTX 20xx, GTX 16xx
+            + `-gencode arch=compute_80,code=sm_80 `  // Ampere: A100
+            + `-gencode arch=compute_86,code=sm_86 `  // Ampere: RTX 30xx
+            + `-gencode arch=compute_89,code=sm_89 `  // Ada: RTX 40xx
+            + `-gencode arch=compute_90,code=sm_90 `  // Hopper: H100
+            + `-gencode arch=compute_90,code=compute_90`, { // PTX for future
             env: cleanEnv
         });
         obj_files.push(objFile);
@@ -138,9 +148,18 @@ async function build() {
     
     if (!(await check_installed('nvcc'))) return;
     
+    // 编译单个包含所有架构的 .node 文件（类似 PyTorch）
+    console.log('\n=== Building universal binary with all GPU architectures ===');
     await compile(vars);
     await link();
-    console.log(`Build complete: ${path.join('build', 'win', 'jstorch.node')}`);
+    console.log(`\n✓ Build complete: ${path.join('build', 'win', 'jstorch.node')}`);
+    console.log('\nSupported GPU architectures:');
+    console.log('  - sm_75: Turing (RTX 20xx, GTX 16xx, Tesla T4, Quadro RTX)');
+    console.log('  - sm_80: Ampere (A100, A30, A40)');
+    console.log('  - sm_86: Ampere (RTX 30xx, A10, A16, A2)');
+    console.log('  - sm_89: Ada Lovelace (RTX 40xx, L4, L40)');
+    console.log('  - sm_90: Hopper (H100, H800)');
+    console.log('  - PTX: Future/unknown architectures (JIT compiled at runtime)');
 }
 
 build();

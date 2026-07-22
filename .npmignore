@@ -1,0 +1,28 @@
+# 构建相关
+native/
+Makefile.js
+scripts/
+.vscode/
+.letta/
+
+# Git
+.git/
+.gitignore
+
+# 测试文件
+src/test1.js
+
+# 中间文件
+*.obj
+*.exp
+*.lib
+native/cpp_obj/
+native/cu_obj/
+
+# 开发依赖
+node_modules/
+package-lock.json
+
+# 文档
+*.md
+!README.md
