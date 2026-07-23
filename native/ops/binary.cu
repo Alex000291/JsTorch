@@ -30,10 +30,20 @@ __global__ void broadcast_kernel(
     out[idx] = op(a[a_idx], b[b_idx]);
 }
 
+// Binary op structs
 struct AddOp { __device__ float operator()(float a, float b) const { return a + b; } };
 struct SubOp { __device__ float operator()(float a, float b) const { return a - b; } };
 struct MulOp { __device__ float operator()(float a, float b) const { return a * b; } };
 struct DivOp { __device__ float operator()(float a, float b) const { return a / b; } };
+struct MaxOp { __device__ float operator()(float a, float b) const { return fmaxf(a, b); } };
+struct MinOp { __device__ float operator()(float a, float b) const { return fminf(a, b); } };
+struct PowOp { __device__ float operator()(float a, float b) const { return powf(a, b); } };
+struct GtOp  { __device__ float operator()(float a, float b) const { return a > b ? 1.0f : 0.0f; } };
+struct LtOp  { __device__ float operator()(float a, float b) const { return a < b ? 1.0f : 0.0f; } };
+struct GeOp  { __device__ float operator()(float a, float b) const { return a >= b ? 1.0f : 0.0f; } };
+struct LeOp  { __device__ float operator()(float a, float b) const { return a <= b ? 1.0f : 0.0f; } };
+struct EqOp  { __device__ float operator()(float a, float b) const { return a == b ? 1.0f : 0.0f; } };
+struct NeOp  { __device__ float operator()(float a, float b) const { return a != b ? 1.0f : 0.0f; } };
 
 template<typename BinaryOp>
 void launch_broadcast(
@@ -49,40 +59,28 @@ void launch_broadcast(
     );
 }
 
+// Macro to reduce boilerplate
+#define BROADCAST_EXTERN(name, OpType) \
+void launch_broadcast_##name( \
+    const float* a, const int* a_shape, const int* a_strides, \
+    const float* b, const int* b_shape, const int* b_strides, \
+    float* out, const int* out_shape, int ndim, int total_size, cudaStream_t stream \
+) { launch_broadcast(a, a_shape, a_strides, b, b_shape, b_strides, out, out_shape, ndim, total_size, OpType(), stream); }
+
 extern "C" {
-
-void launch_broadcast_add(
-    const float* a, const int* a_shape, const int* a_strides,
-    const float* b, const int* b_shape, const int* b_strides,
-    float* out, const int* out_shape, int ndim, int total_size, cudaStream_t stream
-) {
-    launch_broadcast(a, a_shape, a_strides, b, b_shape, b_strides, out, out_shape, ndim, total_size, AddOp(), stream);
-}
-
-void launch_broadcast_sub(
-    const float* a, const int* a_shape, const int* a_strides,
-    const float* b, const int* b_shape, const int* b_strides,
-    float* out, const int* out_shape, int ndim, int total_size, cudaStream_t stream
-) {
-    launch_broadcast(a, a_shape, a_strides, b, b_shape, b_strides, out, out_shape, ndim, total_size, SubOp(), stream);
-}
-
-void launch_broadcast_mul(
-    const float* a, const int* a_shape, const int* a_strides,
-    const float* b, const int* b_shape, const int* b_strides,
-    float* out, const int* out_shape, int ndim, int total_size, cudaStream_t stream
-) {
-    launch_broadcast(a, a_shape, a_strides, b, b_shape, b_strides, out, out_shape, ndim, total_size, MulOp(), stream);
-}
-
-void launch_broadcast_div(
-    const float* a, const int* a_shape, const int* a_strides,
-    const float* b, const int* b_shape, const int* b_strides,
-    float* out, const int* out_shape, int ndim, int total_size, cudaStream_t stream
-) {
-    launch_broadcast(a, a_shape, a_strides, b, b_shape, b_strides, out, out_shape, ndim, total_size, DivOp(), stream);
-}
-
+    BROADCAST_EXTERN(add, AddOp)
+    BROADCAST_EXTERN(sub, SubOp)
+    BROADCAST_EXTERN(mul, MulOp)
+    BROADCAST_EXTERN(div, DivOp)
+    BROADCAST_EXTERN(maximum, MaxOp)
+    BROADCAST_EXTERN(minimum, MinOp)
+    BROADCAST_EXTERN(pow, PowOp)
+    BROADCAST_EXTERN(gt, GtOp)
+    BROADCAST_EXTERN(lt, LtOp)
+    BROADCAST_EXTERN(ge, GeOp)
+    BROADCAST_EXTERN(le, LeOp)
+    BROADCAST_EXTERN(eq, EqOp)
+    BROADCAST_EXTERN(ne, NeOp)
 }
 
 }

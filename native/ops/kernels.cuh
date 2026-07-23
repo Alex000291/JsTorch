@@ -29,6 +29,17 @@ struct CosOp { __device__ float operator()(float x) const { return cosf(x); } };
 struct SigmoidOp { __device__ float operator()(float x) const { return 1.0f / (1.0f + expf(-x)); } };
 struct TanhOp { __device__ float operator()(float x) const { return tanhf(x); } };
 struct ReluOp { __device__ float operator()(float x) const { return fmaxf(0.0f, x); } };
+struct NegOp { __device__ float operator()(float x) const { return -x; } };
+struct FloorOp { __device__ float operator()(float x) const { return floorf(x); } };
+struct CeilOp { __device__ float operator()(float x) const { return ceilf(x); } };
+struct RoundOp { __device__ float operator()(float x) const { return roundf(x); } };
+struct SiluOp { __device__ float operator()(float x) const { return x / (1.0f + expf(-x)); } };
+struct GeluOp { __device__ float operator()(float x) const { return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x))); } };
+struct SoftplusOp { __device__ float operator()(float x) const { return x > 20.0f ? x : logf(1.0f + expf(x)); } };
+
+// Parameterized unary ops
+struct LeakyReluOp { float slope; __device__ float operator()(float x) const { return x > 0.0f ? x : slope * x; } };
+struct ClampOp { float lo, hi; __device__ float operator()(float x) const { return fminf(fmaxf(x, lo), hi); } };
 
 }
 }
