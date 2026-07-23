@@ -541,6 +541,136 @@ public:
     const std::vector<int>& shape() const { return shape_; }
     int size() const { return size_; }
     cudaStream_t stream() const { return stream_; }
+    
+    // Conv2D
+    // input: this tensor [batch, in_channels, height, width]
+    // weight: [out_channels, in_channels, kernel_h, kernel_w]
+    // bias: [out_channels] or null
+    // Returns: [batch, out_channels, out_h, out_w]
+    Napi::Value Conv2D(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        
+        // Parse arguments: weight, bias (optional), stride, padding
+        Tensor* weight = Tensor::Unwrap(info[0].As<Napi::Object>());
+        Tensor* bias = info[1].IsNull() ? nullptr : Tensor::Unwrap(info[1].As<Napi::Object>());
+        
+        int stride_h = info[2].As<Napi::Number>().Int32Value();
+        int stride_w = info[3].As<Napi::Number>().Int32Value();
+        int padding_h = info[4].As<Napi::Number>().Int32Value();
+        int padding_w = info[5].As<Napi::Number>().Int32Value();
+        
+        // Input shape: [batch, in_channels, height, width]
+        if (shape_.size() != 4) {
+            Napi::TypeError::New(env, "Conv2D input must be 4D [batch, channels, height, width]").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+        
+        int batch = shape_[0];
+        int in_channels = shape_[1];
+        int input_h = shape_[2];
+        int input_w = shape_[3];
+        
+        // Weight shape: [out_channels, in_channels, kernel_h, kernel_w]
+        int out_channels = weight->shape_[0];
+        int kernel_h = weight->shape_[2];
+        int kernel_w = weight->shape_[3];
+        
+        // Calculate output dimensions
+        int output_h = (input_h + 2 * padding_h - kernel_h) / stride_h + 1;
+        int output_w = (input_w + 2 * padding_w - kernel_w) / stride_w + 1;
+        
+        // Create output tensor
+        std::vector<int> out_shape = {batch, out_channels, output_h, output_w};
+        int out_size = batch * out_channels * output_h * output_w;
+        
+        // Allocate output GPU memory
+        float* d_out;
+        cudaMalloc(&d_out, out_size * sizeof(float));
+        
+        // Launch kernel
+        launch_conv2d(
+            d_data_, weight->d_data_, bias ? bias->d_data_ : nullptr, d_out,
+            batch, in_channels, out_channels,
+            input_h, input_w, kernel_h, kernel_w,
+            stride_h, stride_w, padding_h, padding_w,
+            output_h, output_w, stream_
+        );
+        
+        cudaStreamSynchronize(stream_);
+        
+        // Create result tensor from GPU data
+        std::vector<float> host_data(out_size);
+        cudaMemcpy(host_data.data(), d_out, out_size * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaFree(d_out);
+        
+        // Convert to nested JS array
+        Napi::Value resultData = buildNestedArray(env, host_data, out_shape, 0, 0);
+        
+        // Create Tensor
+        Napi::FunctionReference* constructor = env.GetInstanceData<Napi::FunctionReference>();
+        return constructor->New({ resultData });
+    }
+    
+    // MaxPool2D
+    // input: this tensor [batch, channels, height, width]
+    // Returns: [batch, channels, out_h, out_w]
+    Napi::Value MaxPool2D(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        
+        // Parse arguments: kernel_size, stride, padding
+        int kernel_h = info[0].As<Napi::Number>().Int32Value();
+        int kernel_w = info[1].As<Napi::Number>().Int32Value();
+        int stride_h = info[2].As<Napi::Number>().Int32Value();
+        int stride_w = info[3].As<Napi::Number>().Int32Value();
+        int padding_h = info[4].As<Napi::Number>().Int32Value();
+        int padding_w = info[5].As<Napi::Number>().Int32Value();
+        
+        // Input shape: [batch, channels, height, width]
+        if (shape_.size() != 4) {
+            Napi::TypeError::New(env, "MaxPool2D input must be 4D [batch, channels, height, width]").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+        
+        int batch = shape_[0];
+        int channels = shape_[1];
+        int input_h = shape_[2];
+        int input_w = shape_[3];
+        
+        // Calculate output dimensions
+        int output_h = (input_h + 2 * padding_h - kernel_h) / stride_h + 1;
+        int output_w = (input_w + 2 * padding_w - kernel_w) / stride_w + 1;
+        
+        // Create output tensor
+        std::vector<int> out_shape = {batch, channels, output_h, output_w};
+        int out_size = batch * channels * output_h * output_w;
+        
+        // Allocate output GPU memory
+        float* d_out;
+        cudaMalloc(&d_out, out_size * sizeof(float));
+        
+        // Launch kernel
+        launch_maxpool2d(
+            d_data_, d_out,
+            batch, channels,
+            input_h, input_w, kernel_h, kernel_w,
+            stride_h, stride_w, padding_h, padding_w,
+            output_h, output_w, stream_
+        );
+        
+        cudaStreamSynchronize(stream_);
+        
+        // Create result tensor from GPU data
+        std::vector<float> host_data(out_size);
+        cudaMemcpy(host_data.data(), d_out, out_size * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaFree(d_out);
+        
+        // Convert to nested JS array
+        Napi::Value resultData = buildNestedArray(env, host_data, out_shape, 0, 0);
+        
+        // Create Tensor
+        Napi::FunctionReference* constructor = env.GetInstanceData<Napi::FunctionReference>();
+        return constructor->New({ resultData });
+    }
 };
 
 // ==================== Tensor Factory Functions ====================
@@ -648,98 +778,6 @@ Napi::Value Ones(const Napi::CallbackInfo& info) {
 }
 
 // ==================== Module Initialization ====================
-
-    // Conv2D
-    // input: this tensor [batch, in_channels, height, width]
-    // weight: [out_channels, in_channels, kernel_h, kernel_w]
-    // bias: [out_channels] or null
-    // Returns: [batch, out_channels, out_h, out_w]
-    Napi::Value Conv2D(const Napi::CallbackInfo& info) {
-        Napi::Env env = info.Env();
-        
-        // Parse arguments: weight, bias (optional), stride, padding
-        Tensor* weight = Tensor::Unwrap(info[0].As<Napi::Object>());
-        Tensor* bias = info[1].IsNull() ? nullptr : Tensor::Unwrap(info[1].As<Napi::Object>());
-        
-        int stride_h = info[2].As<Napi::Number>().Int32Value();
-        int stride_w = info[3].As<Napi::Number>().Int32Value();
-        int padding_h = info[4].As<Napi::Number>().Int32Value();
-        int padding_w = info[5].As<Napi::Number>().Int32Value();
-        
-        // Input shape: [batch, in_channels, height, width]
-        int batch = shape_[0];
-        int in_channels = shape_[1];
-        int input_h = shape_[2];
-        int input_w = shape_[3];
-        
-        // Weight shape: [out_channels, in_channels, kernel_h, kernel_w]
-        int out_channels = weight->shape_[0];
-        int kernel_h = weight->shape_[2];
-        int kernel_w = weight->shape_[3];
-        
-        // Calculate output dimensions
-        int output_h = (input_h + 2 * padding_h - kernel_h) / stride_h + 1;
-        int output_w = (input_w + 2 * padding_w - kernel_w) / stride_w + 1;
-        
-        // Create output tensor
-        std::vector<int> out_shape = {batch, out_channels, output_h, output_w};
-        Tensor* result = createTensorWithShape(env, out_shape);
-        
-        // Launch kernel
-        launch_conv2d(
-            d_data_, weight->d_data_, bias ? bias->d_data_ : nullptr, result->d_data_,
-            batch, in_channels, out_channels,
-            input_h, input_w, kernel_h, kernel_w,
-            stride_h, stride_w, padding_h, padding_w,
-            output_h, output_w, stream_
-        );
-        
-        cudaStreamSynchronize(stream_);
-        
-        return result->Value();
-    }
-    
-    // MaxPool2D
-    // input: this tensor [batch, channels, height, width]
-    // Returns: [batch, channels, out_h, out_w]
-    Napi::Value MaxPool2D(const Napi::CallbackInfo& info) {
-        Napi::Env env = info.Env();
-        
-        // Parse arguments: kernel_size, stride, padding
-        int kernel_h = info[0].As<Napi::Number>().Int32Value();
-        int kernel_w = info[1].As<Napi::Number>().Int32Value();
-        int stride_h = info[2].As<Napi::Number>().Int32Value();
-        int stride_w = info[3].As<Napi::Number>().Int32Value();
-        int padding_h = info[4].As<Napi::Number>().Int32Value();
-        int padding_w = info[5].As<Napi::Number>().Int32Value();
-        
-        // Input shape: [batch, channels, height, width]
-        int batch = shape_[0];
-        int channels = shape_[1];
-        int input_h = shape_[2];
-        int input_w = shape_[3];
-        
-        // Calculate output dimensions
-        int output_h = (input_h + 2 * padding_h - kernel_h) / stride_h + 1;
-        int output_w = (input_w + 2 * padding_w - kernel_w) / stride_w + 1;
-        
-        // Create output tensor
-        std::vector<int> out_shape = {batch, channels, output_h, output_w};
-        Tensor* result = createTensorWithShape(env, out_shape);
-        
-        // Launch kernel
-        launch_maxpool2d(
-            d_data_, result->d_data_,
-            batch, channels,
-            input_h, input_w, kernel_h, kernel_w,
-            stride_h, stride_w, padding_h, padding_w,
-            output_h, output_w, stream_
-        );
-        
-        cudaStreamSynchronize(stream_);
-        
-        return result->Value();
-    }
 
 // Cleanup function for module unload
 static void CleanupCublas() {
