@@ -71,19 +71,27 @@ export function conv2d(in_channels, out_channels, kernel_size, stride = 1, paddi
   );
   
   const weight = tensor(weight_data, true);
-  const bias_tensor = bias ? tensor([Array(out_channels).fill(0)], true) : null;
+  const bias_tensor = bias ? tensor(Array(out_channels).fill(0), true) : null;
   
   return {
     forward: (x) => {
       // x: [batch, in_channels, height, width]
-      const out = x.conv2d(weight, bias_tensor, stride_h, stride_w, padding_h, padding_w);
-      return out;
+      // Autograd is handled inside tensor.conv2d()
+      return x.conv2d(weight, bias_tensor, stride_h, stride_w, padding_h, padding_w);
     },
     
     parameters: () => bias_tensor ? [weight, bias_tensor] : [weight],
     
     weight,
-    bias: bias_tensor
+    bias: bias_tensor,
+    
+    // Metadata for debugging
+    config: {
+      in_channels, out_channels,
+      kernel_h, kernel_w,
+      stride_h, stride_w,
+      padding_h, padding_w
+    }
   };
 }
 

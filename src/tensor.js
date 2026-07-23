@@ -279,6 +279,169 @@ export class Tensor {
     return result;
   }
   
+  // Reshape (view with new shape, shares underlying data)
+  reshape(new_shape) {
+    // Calculate total size
+    const old_size = this.shape.reduce((a, b) => a * b, 1);
+    let new_size = 1;
+    let infer_dim = -1;
+    
+    // Handle -1 (infer dimension)
+    for (let i = 0; i < new_shape.length; i++) {
+      if (new_shape[i] === -1) {
+        if (infer_dim !== -1) {
+          throw new Error('Only one dimension can be inferred');
+        }
+        infer_dim = i;
+      } else {
+        new_size *= new_shape[i];
+      }
+    }
+    
+    // Infer missing dimension
+    const final_shape = [...new_shape];
+    if (infer_dim !== -1) {
+      final_shape[infer_dim] = old_size / new_size;
+      new_size = old_size;
+    }
+    
+    // Check size matches
+    if (new_size !== old_size) {
+      throw new Error(`Cannot reshape tensor of size ${old_size} to shape [${final_shape}] (size ${new_size})`);
+    }
+    
+    // Get flattened data
+    const data = this._native.toArray();
+    
+    // Rebuild nested array with new shape
+    const buildNested = (flat, shape, offset = 0) => {
+      if (shape.length === 1) {
+        return flat.slice(offset, offset + shape[0]);
+      }
+      
+      const result = [];
+      const stride = shape.slice(1).reduce((a, b) => a * b, 1);
+      for (let i = 0; i < shape[0]; i++) {
+        result.push(buildNested(flat, shape.slice(1), offset + i * stride));
+      }
+      return result;
+    };
+    
+    // Flatten data first
+    const flatten = (arr) => {
+      if (!Array.isArray(arr)) return [arr];
+      return arr.reduce((acc, val) => acc.concat(flatten(val)), []);
+    };
+    
+    const flat_data = flatten(data);
+    const reshaped_data = buildNested(flat_data, final_shape);
+    
+    // Create new tensor with reshaped data
+    const result = tensor(reshaped_data, this.requires_grad);
+    
+    // Set up autograd
+    if (this.requires_grad) {
+      result._prev = [this];
+      result._backward = () => {
+        // Gradient flows back with same reshape
+        if (result.grad) {
+          const grad_reshaped = result.grad.reshape(this.shape);
+          this.grad = this.grad ? this.grad.add(grad_reshaped) : grad_reshaped;
+        }
+      };
+    }
+    
+    return result;
+  }
+  
+  // View (alias for reshape)
+  view(new_shape) {
+    return this.reshape(new_shape);
+  }
+  
+  // Flatten to 1D or 2D
+  flatten(start_dim = 0, end_dim = -1) {
+    if (end_dim === -1) end_dim = this.shape.length - 1;
+    
+    // Calculate new shape
+    const new_shape = [];
+    let flatten_size = 1;
+    
+    for (let i = 0; i < this.shape.length; i++) {
+      if (i < start_dim || i > end_dim) {
+        new_shape.push(this.shape[i]);
+      } else {
+        flatten_size *= this.shape[i];
+      }
+    }
+    
+    // Insert flattened dimension
+    new_shape.splice(start_dim, 0, flatten_size);
+    
+    return this.reshape(new_shape);
+  }
+  
+  // Conv2D with autograd
+  // input: this [batch, in_channels, height, width]
+  // weight: [out_channels, in_channels, kernel_h, kernel_w]
+  // bias: [out_channels] or null
+  // Returns: [batch, out_channels, out_h, out_w]
+  conv2d(weight, bias, stride_h, stride_w, padding_h, padding_w) {
+    const result = new Tensor(null);
+    result._native = this._native.conv2d(
+      weight._native,
+      bias ? bias._native : null,
+      stride_h, stride_w, padding_h, padding_w
+    );
+    
+    if (is_grad_enabled() && (this.requires_grad || weight.requires_grad || (bias && bias.requires_grad))) {
+      result.requires_grad = true;
+      result._prev = bias ? [this, weight, bias] : [this, weight];
+      result._op = 'conv2d';
+      
+      // Save metadata for backward
+      const input_shape = this.shape;
+      const weight_shape = weight.shape;
+      const has_bias = bias !== null;
+      
+      result._grad_fn = () => {
+        // Backward for input
+        if (this.requires_grad) {
+          const grad_input_native = result.grad._native.conv2dBackwardInput(
+            weight._native,
+            input_shape,
+            stride_h, stride_w, padding_h, padding_w
+          );
+          const grad_input = new Tensor(null);
+          grad_input._native = grad_input_native;
+          this.grad = this.grad ? this.grad.add(grad_input) : grad_input;
+        }
+        
+        // Backward for weight
+        if (weight.requires_grad) {
+          const grad_weight_native = result.grad._native.conv2dBackwardWeight(
+            this._native,
+            weight_shape,
+            stride_h, stride_w, padding_h, padding_w
+          );
+          const grad_weight = new Tensor(null);
+          grad_weight._native = grad_weight_native;
+          weight.grad = weight.grad ? weight.grad.add(grad_weight) : grad_weight;
+        }
+        
+        // Backward for bias
+        if (has_bias && bias.requires_grad) {
+          const grad_bias_native = result.grad._native.conv2dBackwardBias();
+          const grad_bias = new Tensor(null);
+          grad_bias._native = grad_bias_native;
+          bias.grad = bias.grad ? bias.grad.add(grad_bias) : grad_bias;
+        }
+      };
+    }
+    
+    return result;
+  }
+  
   // Utilities
   toArray() {
     return this._native.toArray();

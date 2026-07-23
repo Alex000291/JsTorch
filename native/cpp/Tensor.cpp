@@ -31,6 +31,19 @@ extern "C" {
                       int input_h, int input_w, int kernel_h, int kernel_w,
                       int stride_h, int stride_w, int padding_h, int padding_w,
                       int output_h, int output_w, cudaStream_t stream);
+    void launch_conv2d_backward_input(const float* grad_output, const float* weight, float* grad_input,
+                                     int batch, int in_channels, int out_channels,
+                                     int input_h, int input_w, int kernel_h, int kernel_w,
+                                     int stride_h, int stride_w, int padding_h, int padding_w,
+                                     int output_h, int output_w, cudaStream_t stream);
+    void launch_conv2d_backward_weight(const float* input, const float* grad_output, float* grad_weight,
+                                      int batch, int in_channels, int out_channels,
+                                      int input_h, int input_w, int kernel_h, int kernel_w,
+                                      int stride_h, int stride_w, int padding_h, int padding_w,
+                                      int output_h, int output_w, cudaStream_t stream);
+    void launch_conv2d_backward_bias(const float* grad_output, float* grad_bias,
+                                    int batch, int out_channels, int output_h, int output_w,
+                                    cudaStream_t stream);
     void launch_maxpool2d(const float* input, float* output,
                          int batch, int channels, int input_h, int input_w,
                          int kernel_h, int kernel_w, int stride_h, int stride_w,
@@ -95,6 +108,9 @@ public:
             InstanceMethod("item", &Tensor::Item),
             InstanceMethod("toArray", &Tensor::ToArray),
             InstanceMethod("conv2d", &Tensor::Conv2D),
+            InstanceMethod("conv2dBackwardInput", &Tensor::Conv2DBackwardInput),
+            InstanceMethod("conv2dBackwardWeight", &Tensor::Conv2DBackwardWeight),
+            InstanceMethod("conv2dBackwardBias", &Tensor::Conv2DBackwardBias),
             InstanceMethod("maxpool2d", &Tensor::MaxPool2D),
             InstanceAccessor("shape", &Tensor::GetShape, nullptr),
             InstanceAccessor("size", &Tensor::GetSize, nullptr),
@@ -542,7 +558,9 @@ public:
     int size() const { return size_; }
     cudaStream_t stream() const { return stream_; }
     
-    // Conv2D
+    // ==================== Conv2D Forward ====================
+    
+    // Conv2D Forward
     // input: this tensor [batch, in_channels, height, width]
     // weight: [out_channels, in_channels, kernel_h, kernel_w]
     // bias: [out_channels] or null
@@ -610,6 +628,176 @@ public:
         Napi::FunctionReference* constructor = env.GetInstanceData<Napi::FunctionReference>();
         return constructor->New({ resultData });
     }
+    
+    // ==================== Conv2D Backward ====================
+    
+    // Conv2D Backward Input
+    // grad_output: this tensor [batch, out_channels, out_h, out_w]
+    // weight: [out_channels, in_channels, kernel_h, kernel_w]
+    // input_shape: [batch, in_channels, input_h, input_w]
+    // Returns: grad_input [batch, in_channels, input_h, input_w]
+    Napi::Value Conv2DBackwardInput(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        
+        // Parse arguments: weight, input_shape, stride, padding
+        Tensor* weight = Tensor::Unwrap(info[0].As<Napi::Object>());
+        Napi::Array input_shape_arr = info[1].As<Napi::Array>();
+        int stride_h = info[2].As<Napi::Number>().Int32Value();
+        int stride_w = info[3].As<Napi::Number>().Int32Value();
+        int padding_h = info[4].As<Napi::Number>().Int32Value();
+        int padding_w = info[5].As<Napi::Number>().Int32Value();
+        
+        // Parse input shape
+        int batch = input_shape_arr.Get(uint32_t(0)).As<Napi::Number>().Int32Value();
+        int in_channels = input_shape_arr.Get(uint32_t(1)).As<Napi::Number>().Int32Value();
+        int input_h = input_shape_arr.Get(uint32_t(2)).As<Napi::Number>().Int32Value();
+        int input_w = input_shape_arr.Get(uint32_t(3)).As<Napi::Number>().Int32Value();
+        
+        // grad_output shape: this tensor
+        int out_channels = shape_[1];
+        int output_h = shape_[2];
+        int output_w = shape_[3];
+        
+        // Weight shape
+        int kernel_h = weight->shape_[2];
+        int kernel_w = weight->shape_[3];
+        
+        // Allocate grad_input
+        std::vector<int> grad_input_shape = {batch, in_channels, input_h, input_w};
+        int grad_input_size = batch * in_channels * input_h * input_w;
+        
+        float* d_grad_input;
+        cudaMalloc(&d_grad_input, grad_input_size * sizeof(float));
+        
+        // Launch backward input kernel
+        launch_conv2d_backward_input(
+            d_data_, weight->d_data_, d_grad_input,
+            batch, in_channels, out_channels,
+            input_h, input_w, kernel_h, kernel_w,
+            stride_h, stride_w, padding_h, padding_w,
+            output_h, output_w, stream_
+        );
+        
+        cudaStreamSynchronize(stream_);
+        
+        // Copy to host
+        std::vector<float> host_data(grad_input_size);
+        cudaMemcpy(host_data.data(), d_grad_input, grad_input_size * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaFree(d_grad_input);
+        
+        // Convert to nested array
+        Napi::Value resultData = buildNestedArray(env, host_data, grad_input_shape, 0, 0);
+        
+        // Create Tensor
+        Napi::FunctionReference* constructor = env.GetInstanceData<Napi::FunctionReference>();
+        return constructor->New({ resultData });
+    }
+    
+    // Conv2D Backward Weight
+    // grad_output: this tensor [batch, out_channels, out_h, out_w]
+    // input: [batch, in_channels, input_h, input_w]
+    // weight_shape: [out_channels, in_channels, kernel_h, kernel_w]
+    // Returns: grad_weight [out_channels, in_channels, kernel_h, kernel_w]
+    Napi::Value Conv2DBackwardWeight(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        
+        // Parse arguments: input, weight_shape, stride, padding
+        Tensor* input = Tensor::Unwrap(info[0].As<Napi::Object>());
+        Napi::Array weight_shape_arr = info[1].As<Napi::Array>();
+        int stride_h = info[2].As<Napi::Number>().Int32Value();
+        int stride_w = info[3].As<Napi::Number>().Int32Value();
+        int padding_h = info[4].As<Napi::Number>().Int32Value();
+        int padding_w = info[5].As<Napi::Number>().Int32Value();
+        
+        // Parse weight shape
+        int out_channels = weight_shape_arr.Get(uint32_t(0)).As<Napi::Number>().Int32Value();
+        int in_channels = weight_shape_arr.Get(uint32_t(1)).As<Napi::Number>().Int32Value();
+        int kernel_h = weight_shape_arr.Get(uint32_t(2)).As<Napi::Number>().Int32Value();
+        int kernel_w = weight_shape_arr.Get(uint32_t(3)).As<Napi::Number>().Int32Value();
+        
+        // Input shape
+        int batch = input->shape_[0];
+        int input_h = input->shape_[2];
+        int input_w = input->shape_[3];
+        
+        // grad_output shape: this tensor
+        int output_h = shape_[2];
+        int output_w = shape_[3];
+        
+        // Allocate grad_weight
+        std::vector<int> grad_weight_shape = {out_channels, in_channels, kernel_h, kernel_w};
+        int grad_weight_size = out_channels * in_channels * kernel_h * kernel_w;
+        
+        float* d_grad_weight;
+        cudaMalloc(&d_grad_weight, grad_weight_size * sizeof(float));
+        
+        // Launch backward weight kernel
+        launch_conv2d_backward_weight(
+            input->d_data_, d_data_, d_grad_weight,
+            batch, in_channels, out_channels,
+            input_h, input_w, kernel_h, kernel_w,
+            stride_h, stride_w, padding_h, padding_w,
+            output_h, output_w, stream_
+        );
+        
+        cudaStreamSynchronize(stream_);
+        
+        // Copy to host
+        std::vector<float> host_data(grad_weight_size);
+        cudaMemcpy(host_data.data(), d_grad_weight, grad_weight_size * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaFree(d_grad_weight);
+        
+        // Convert to nested array
+        Napi::Value resultData = buildNestedArray(env, host_data, grad_weight_shape, 0, 0);
+        
+        // Create Tensor
+        Napi::FunctionReference* constructor = env.GetInstanceData<Napi::FunctionReference>();
+        return constructor->New({ resultData });
+    }
+    
+    // Conv2D Backward Bias
+    // grad_output: this tensor [batch, out_channels, out_h, out_w]
+    // Returns: grad_bias [out_channels]
+    Napi::Value Conv2DBackwardBias(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        
+        // grad_output shape: this tensor
+        int batch = shape_[0];
+        int out_channels = shape_[1];
+        int output_h = shape_[2];
+        int output_w = shape_[3];
+        
+        // Allocate grad_bias
+        std::vector<int> grad_bias_shape = {out_channels};
+        
+        float* d_grad_bias;
+        cudaMalloc(&d_grad_bias, out_channels * sizeof(float));
+        
+        // Launch backward bias kernel
+        launch_conv2d_backward_bias(
+            d_data_, d_grad_bias,
+            batch, out_channels, output_h, output_w, stream_
+        );
+        
+        cudaStreamSynchronize(stream_);
+        
+        // Copy to host
+        std::vector<float> host_data(out_channels);
+        cudaMemcpy(host_data.data(), d_grad_bias, out_channels * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaFree(d_grad_bias);
+        
+        // Convert to nested array (1D)
+        Napi::Array result = Napi::Array::New(env, out_channels);
+        for (int i = 0; i < out_channels; i++) {
+            result[i] = Napi::Number::New(env, host_data[i]);
+        }
+        
+        // Create Tensor
+        Napi::FunctionReference* constructor = env.GetInstanceData<Napi::FunctionReference>();
+        return constructor->New({ result });
+    }
+    
+    // ==================== MaxPool2D ====================
     
     // MaxPool2D
     // input: this tensor [batch, channels, height, width]
