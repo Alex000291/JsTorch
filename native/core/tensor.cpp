@@ -2,6 +2,7 @@
 #include <stdexcept>
 #include <cstdlib>
 #include <ctime>
+#include <cmath>
 
 namespace jstorch {
 
@@ -25,9 +26,18 @@ extern "C" {
     void launch_silu(const float*, float*, int, cudaStream_t);
     void launch_gelu(const float*, float*, int, cudaStream_t);
     void launch_softplus(const float*, float*, int, cudaStream_t);
+    void launch_log1p(const float*, float*, int, cudaStream_t);
+    void launch_reciprocal(const float*, float*, int, cudaStream_t);
+    void launch_sign(const float*, float*, int, cudaStream_t);
     // Unary (parameterized)
     void launch_leaky_relu(const float*, float*, int, float, cudaStream_t);
     void launch_clamp(const float*, float*, int, float, float, cudaStream_t);
+    void launch_fmod(const float*, float*, int, float, cudaStream_t);
+    void launch_clamp_min(const float*, float*, int, float, cudaStream_t);
+    void launch_clamp_max(const float*, float*, int, float, cudaStream_t);
+    void launch_pow_scalar(const float*, float*, int, float, cudaStream_t);
+    void launch_mul_scalar(const float*, float*, int, float, cudaStream_t);
+    void launch_add_scalar(const float*, float*, int, float, cudaStream_t);
     
     // Binary (broadcast) — macro-generated in binary.cu
     #define DECL_BROADCAST(name) \
@@ -41,6 +51,8 @@ extern "C" {
     // Reduce
     void launch_reduce_sum(const float*, float*, int, int, int, cudaStream_t);
     void launch_reduce_mean(const float*, float*, int, int, int, cudaStream_t);
+    void launch_reduce_max(const float*, float*, int*, int, int, int, cudaStream_t);
+    void launch_reduce_min(const float*, float*, int*, int, int, int, cudaStream_t);
     
     // Misc
     void launch_flip(const float*, float*, const int*, const int*, int, int, int, cudaStream_t);
@@ -56,11 +68,18 @@ extern "C" {
     void launch_matmul(const float*, const float*, float*, int, int, int, cudaStream_t);
     void launch_bmm(const float*, const float*, float*, int, int, int, int, cudaStream_t);
     
-    // Conv
+    // Conv1d
     void launch_conv1d(const float*, const float*, const float*, float*, float*,
         int, int, int, int, int, int, int, int, int, int, cudaStream_t);
     void launch_conv_transpose1d(const float*, const float*, const float*, float*, float*,
         int, int, int, int, int, int, int, int, int, int, cudaStream_t);
+    // Conv2d
+    void launch_conv2d(const float*, const float*, const float*, float*, float*,
+        int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, cudaStream_t);
+    void launch_conv_transpose2d(const float*, const float*, const float*, float*, float*,
+        int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, cudaStream_t);
+    void launch_avgpool2d(const float*, float*,
+        int, int, int, int, int, int, int, int, int, int, int, int, bool, cudaStream_t);
 }
 
 // ==================== Helpers ====================
@@ -146,7 +165,7 @@ Tensor Tensor::squeeze(int axis) const {
         for (int i = 0; i < ndim(); i++) if (i != axis) ns.push_back(shape_[i]);
     }
     if (ns.empty()) ns.push_back(1);
-    return view(ns);
+    return reshape(ns);
 }
 
 Tensor Tensor::unsqueeze(int axis) const {
@@ -216,6 +235,7 @@ UNARY(cos, launch_cos)   UNARY(neg, launch_neg)     UNARY(floor, launch_floor)
 UNARY(ceil, launch_ceil) UNARY(round, launch_round) UNARY(sigmoid, launch_sigmoid)
 UNARY(tanh, launch_tanh) UNARY(relu, launch_relu)   UNARY(silu, launch_silu)
 UNARY(gelu, launch_gelu) UNARY(softplus, launch_softplus)
+UNARY(log1p, launch_log1p) UNARY(reciprocal, launch_reciprocal) UNARY(sign, launch_sign)
 
 Tensor Tensor::leaky_relu(float slope) const {
     Tensor c = contiguous(); Tensor r(shape_, dtype_);
@@ -226,6 +246,36 @@ Tensor Tensor::leaky_relu(float slope) const {
 Tensor Tensor::clamp(float lo, float hi) const {
     Tensor c = contiguous(); Tensor r(shape_, dtype_);
     launch_clamp(c.data<float>(), r.data<float>(), size(), lo, hi, 0);
+    cudaDeviceSynchronize(); return r;
+}
+Tensor Tensor::clamp_min(float lo) const {
+    Tensor c = contiguous(); Tensor r(shape_, dtype_);
+    launch_clamp_min(c.data<float>(), r.data<float>(), size(), lo, 0);
+    cudaDeviceSynchronize(); return r;
+}
+Tensor Tensor::clamp_max(float hi) const {
+    Tensor c = contiguous(); Tensor r(shape_, dtype_);
+    launch_clamp_max(c.data<float>(), r.data<float>(), size(), hi, 0);
+    cudaDeviceSynchronize(); return r;
+}
+Tensor Tensor::fmod(float d) const {
+    Tensor c = contiguous(); Tensor r(shape_, dtype_);
+    launch_fmod(c.data<float>(), r.data<float>(), size(), d, 0);
+    cudaDeviceSynchronize(); return r;
+}
+Tensor Tensor::pow_scalar(float e) const {
+    Tensor c = contiguous(); Tensor r(shape_, dtype_);
+    launch_pow_scalar(c.data<float>(), r.data<float>(), size(), e, 0);
+    cudaDeviceSynchronize(); return r;
+}
+Tensor Tensor::mul_scalar(float s) const {
+    Tensor c = contiguous(); Tensor r(shape_, dtype_);
+    launch_mul_scalar(c.data<float>(), r.data<float>(), size(), s, 0);
+    cudaDeviceSynchronize(); return r;
+}
+Tensor Tensor::add_scalar(float s) const {
+    Tensor c = contiguous(); Tensor r(shape_, dtype_);
+    launch_add_scalar(c.data<float>(), r.data<float>(), size(), s, 0);
     cudaDeviceSynchronize(); return r;
 }
 
@@ -289,6 +339,158 @@ Tensor Tensor::mean(int dim, bool keepdim) const {
     Tensor r(os, dtype_);
     launch_reduce_mean(c.data<float>(), r.data<float>(), outer, shape_[dim], inner, 0);
     cudaDeviceSynchronize(); return r;
+}
+
+// ==================== reduce max/min/argmax/argmin ====================
+// Helper for reduce shape computation
+static void compute_reduce_params(const Shape& shape, int dim, int ndim, bool keepdim,
+    int& outer, int& inner, Shape& out_shape) {
+    outer = 1; inner = 1;
+    for (int i = 0; i < dim; i++) outer *= shape[i];
+    for (int i = dim + 1; i < ndim; i++) inner *= shape[i];
+    for (int i = 0; i < ndim; i++) {
+        if (i == dim) { if (keepdim) out_shape.push_back(1); }
+        else out_shape.push_back(shape[i]);
+    }
+    if (out_shape.empty()) out_shape.push_back(1);
+}
+
+Tensor Tensor::max(int dim, bool keepdim) const {
+    Tensor c = contiguous();
+    dim = normalize_axis(dim, ndim());
+    int outer, inner; Shape os;
+    compute_reduce_params(shape_, dim, ndim(), keepdim, outer, inner, os);
+    Tensor r(os, dtype_);
+    launch_reduce_max(c.data<float>(), r.data<float>(), nullptr, outer, shape_[dim], inner, 0);
+    cudaDeviceSynchronize(); return r;
+}
+
+Tensor Tensor::min(int dim, bool keepdim) const {
+    Tensor c = contiguous();
+    dim = normalize_axis(dim, ndim());
+    int outer, inner; Shape os;
+    compute_reduce_params(shape_, dim, ndim(), keepdim, outer, inner, os);
+    Tensor r(os, dtype_);
+    launch_reduce_min(c.data<float>(), r.data<float>(), nullptr, outer, shape_[dim], inner, 0);
+    cudaDeviceSynchronize(); return r;
+}
+
+Tensor Tensor::argmax(int dim) const {
+    Tensor c = contiguous();
+    dim = normalize_axis(dim, ndim());
+    int outer, inner; Shape os;
+    compute_reduce_params(shape_, dim, ndim(), false, outer, inner, os);
+    Tensor dummy(os, dtype_); // values (unused)
+    Tensor r(os, dtype_); // indices stored as float -> int tensor
+    int total = outer * inner;
+    int* d_indices; cudaMalloc(&d_indices, total * sizeof(int));
+    launch_reduce_max(c.data<float>(), dummy.data<float>(), d_indices, outer, shape_[dim], inner, 0);
+    cudaDeviceSynchronize();
+    // Create int tensor
+    Tensor result(os, DType::Float32);
+    void* ptr; cudaMalloc(&ptr, total * sizeof(int));
+    cudaMemcpy(ptr, d_indices, total * sizeof(int), cudaMemcpyDeviceToDevice);
+    cudaFree(d_indices);
+    result.data_ = std::shared_ptr<void>(ptr, [](void* p) { cudaFree(p); });
+    return result;
+}
+
+Tensor Tensor::argmin(int dim) const {
+    Tensor c = contiguous();
+    dim = normalize_axis(dim, ndim());
+    int outer, inner; Shape os;
+    compute_reduce_params(shape_, dim, ndim(), false, outer, inner, os);
+    Tensor dummy(os, dtype_);
+    int total = outer * inner;
+    int* d_indices; cudaMalloc(&d_indices, total * sizeof(int));
+    launch_reduce_min(c.data<float>(), dummy.data<float>(), d_indices, outer, shape_[dim], inner, 0);
+    cudaDeviceSynchronize();
+    Tensor result(os, DType::Float32);
+    void* ptr; cudaMalloc(&ptr, total * sizeof(int));
+    cudaMemcpy(ptr, d_indices, total * sizeof(int), cudaMemcpyDeviceToDevice);
+    cudaFree(d_indices);
+    result.data_ = std::shared_ptr<void>(ptr, [](void* p) { cudaFree(p); });
+    return result;
+}
+
+// ==================== flatten ====================
+Tensor Tensor::flatten(int start_dim, int end_dim) const {
+    start_dim = normalize_axis(start_dim, ndim());
+    if (end_dim < 0) end_dim += ndim();
+    if (end_dim >= ndim()) end_dim = ndim() - 1;
+    Shape ns;
+    for (int i = 0; i < start_dim; i++) ns.push_back(shape_[i]);
+    int flat = 1;
+    for (int i = start_dim; i <= end_dim; i++) flat *= shape_[i];
+    ns.push_back(flat);
+    for (int i = end_dim + 1; i < ndim(); i++) ns.push_back(shape_[i]);
+    return reshape(ns);
+}
+
+// ==================== Conv2d ====================
+Tensor Tensor::conv2d(const Tensor& weight, const Tensor* bias,
+    int sH, int sW, int pH, int pW, int dH, int dW, int groups) const {
+    Tensor ci = contiguous(), cw = weight.contiguous();
+    int B = shape_[0], Ci = shape_[1], H = shape_[2], W = shape_[3];
+    int Co = weight.shape()[0], kH = weight.shape()[2], kW = weight.shape()[3];
+    int Ho = (H + 2*pH - dH*(kH-1) - 1) / sH + 1;
+    int Wo = (W + 2*pW - dW*(kW-1) - 1) / sW + 1;
+    int col_size = B * Ci * kH * kW * Ho * Wo;
+    float* col; cudaMalloc(&col, col_size * sizeof(float));
+    Tensor r({B, Co, Ho, Wo}, dtype_);
+    const float* b_ptr = bias ? bias->data<float>() : nullptr;
+    launch_conv2d(ci.data<float>(), cw.data<float>(), b_ptr, r.data<float>(), col,
+        B, Ci, H, W, Co, kH, kW, sH, sW, pH, pW, dH, dW, groups, Ho, Wo, 0);
+    cudaDeviceSynchronize();
+    cudaFree(col);
+    return r;
+}
+
+Tensor Tensor::conv_transpose2d(const Tensor& weight, const Tensor* bias,
+    int sH, int sW, int pH, int pW, int opH, int opW,
+    int dH, int dW, int groups) const {
+    Tensor ci = contiguous(), cw = weight.contiguous();
+    int B = shape_[0], Ci = shape_[1], Hi = shape_[2], Wi = shape_[3];
+    int Co = weight.shape()[1] * groups, kH = weight.shape()[2], kW = weight.shape()[3];
+    int Ho = (Hi - 1)*sH - 2*pH + dH*(kH-1) + opH + 1;
+    int Wo = (Wi - 1)*sW - 2*pW + dW*(kW-1) + opW + 1;
+    int col_size = B * Co * kH * kW * Hi * Wi;
+    float* col; cudaMalloc(&col, col_size * sizeof(float));
+    Tensor r({B, Co, Ho, Wo}, dtype_);
+    const float* b_ptr = bias ? bias->data<float>() : nullptr;
+    launch_conv_transpose2d(ci.data<float>(), cw.data<float>(), b_ptr, r.data<float>(), col,
+        B, Ci, Hi, Wi, Co, kH, kW, sH, sW, pH, pW, dH, dW, groups, Ho, Wo, 0);
+    cudaDeviceSynchronize();
+    cudaFree(col);
+    return r;
+}
+
+Tensor Tensor::avg_pool2d(int kH, int kW, int sH, int sW, int pH, int pW, bool count_include_pad) const {
+    Tensor c = contiguous();
+    int B = shape_[0], C = shape_[1], H = shape_[2], W = shape_[3];
+    int Ho = (H + 2*pH - kH) / sH + 1;
+    int Wo = (W + 2*pW - kW) / sW + 1;
+    Tensor r({B, C, Ho, Wo}, dtype_);
+    launch_avgpool2d(c.data<float>(), r.data<float>(), B, C, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo, count_include_pad, 0);
+    cudaDeviceSynchronize();
+    return r;
+}
+
+// ==================== Factory: full, arange ====================
+Tensor Tensor::full(const Shape& shape, float value) {
+    Tensor r(shape);
+    // Fill via add_scalar on zero tensor
+    launch_add_scalar(r.data<float>(), r.data<float>(), r.size(), value, 0);
+    cudaDeviceSynchronize();
+    return r;
+}
+
+Tensor Tensor::arange(float start, float end, float step) {
+    int count = (int)std::ceil((end - start) / step);
+    if (count <= 0) return Tensor({0});
+    std::vector<float> data(count);
+    for (int i = 0; i < count; i++) data[i] = start + i * step;
+    return from_array(data.data(), {count});
 }
 
 // ==================== #9 cat ====================

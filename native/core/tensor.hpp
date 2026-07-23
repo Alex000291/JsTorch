@@ -41,22 +41,23 @@ public:
     Tensor clone() const;
     Tensor contiguous() const;
     
-    // View ops (#6, #7, #8)
+    // View ops
     Tensor view(const Shape& new_shape) const;
     Tensor reshape(const Shape& new_shape) const;
     Tensor squeeze(int axis = -1) const;
     Tensor unsqueeze(int axis) const;
-    Tensor transpose() const;                    // 2D only (backward compat)
-    Tensor transpose(int dim0, int dim1) const;  // #6: generalized
-    Tensor slice(int dim, int start, int end) const;  // #7
-    std::vector<Tensor> split(int dim, int chunk_size) const;  // #8
+    Tensor transpose() const;
+    Tensor transpose(int dim0, int dim1) const;
+    Tensor slice(int dim, int start, int end) const;
+    std::vector<Tensor> split(int dim, int chunk_size) const;
+    Tensor flatten(int start_dim, int end_dim) const;
     
     // Complex
     Tensor real() const;
     Tensor imag() const;
     static Tensor from_real_imag(const Tensor& real, const Tensor& imag);
     
-    // Binary ops (broadcast) — #4, #5
+    // Binary ops (broadcast)
     Tensor add(const Tensor& other) const;
     Tensor sub(const Tensor& other) const;
     Tensor mul(const Tensor& other) const;
@@ -71,15 +72,16 @@ public:
     Tensor eq(const Tensor& other) const;
     Tensor ne(const Tensor& other) const;
     
-    // Unary ops — #1, #2, #3
+    // Unary ops
     Tensor abs() const;
     Tensor sqrt() const;
     Tensor square() const;
     Tensor exp() const;
     Tensor log() const;
+    Tensor log1p() const;
     Tensor sin() const;
     Tensor cos() const;
-    Tensor neg() const;         // #1
+    Tensor neg() const;
     Tensor floor() const;
     Tensor ceil() const;
     Tensor round() const;
@@ -89,37 +91,60 @@ public:
     Tensor silu() const;
     Tensor gelu() const;
     Tensor softplus() const;
-    Tensor leaky_relu(float slope = 0.01f) const;  // #3
-    Tensor clamp(float lo, float hi) const;         // #2
+    Tensor reciprocal() const;
+    Tensor sign() const;
+    Tensor leaky_relu(float slope = 0.01f) const;
+    Tensor clamp(float lo, float hi) const;
+    Tensor clamp_min(float lo) const;
+    Tensor clamp_max(float hi) const;
+    Tensor fmod(float d) const;
+    Tensor pow_scalar(float e) const;
+    Tensor mul_scalar(float s) const;
+    Tensor add_scalar(float s) const;
     
     // Reduce
     Tensor sum(int dim = -1, bool keepdim = false) const;
     Tensor mean(int dim = -1, bool keepdim = false) const;
+    Tensor max(int dim, bool keepdim = false) const;
+    Tensor min(int dim, bool keepdim = false) const;
+    Tensor argmax(int dim) const;
+    Tensor argmin(int dim) const;
     
-    // Tensor ops — #9-#13, #16-#20
-    static Tensor cat(const std::vector<Tensor>& tensors, int dim);  // #9
-    Tensor flip(int dim) const;                                       // #10
-    Tensor pad(const std::vector<int>& padding, int mode = 0, float value = 0.0f) const;  // #11
-    Tensor cumsum(int dim) const;                                     // #12
-    static Tensor where(const Tensor& cond, const Tensor& x, const Tensor& y);  // #13
+    // Tensor ops
+    static Tensor cat(const std::vector<Tensor>& tensors, int dim);
+    Tensor flip(int dim) const;
+    Tensor pad(const std::vector<int>& padding, int mode = 0, float value = 0.0f) const;
+    Tensor cumsum(int dim) const;
+    static Tensor where(const Tensor& cond, const Tensor& x, const Tensor& y);
     
-    Tensor matmul(const Tensor& other) const;  // #16
-    Tensor embedding(const Tensor& indices) const;  // #17 (self=weight, indices=int tensor)
+    Tensor matmul(const Tensor& other) const;
+    Tensor embedding(const Tensor& indices) const;
+    
+    // Conv1d
     Tensor conv1d(const Tensor& weight, const Tensor* bias,
-                  int stride, int padding, int dilation, int groups) const;  // #18
+                  int stride, int padding, int dilation, int groups) const;
     Tensor conv_transpose1d(const Tensor& weight, const Tensor* bias,
-                            int stride, int padding, int output_padding, int dilation, int groups) const;  // #19
-    Tensor interpolate(int target_size, int mode, bool align_corners = false) const;  // #20
+                            int stride, int padding, int output_padding, int dilation, int groups) const;
     
-    // Factory — #14, #15
+    // Conv2d
+    Tensor conv2d(const Tensor& weight, const Tensor* bias,
+                  int sH, int sW, int pH, int pW, int dH, int dW, int groups) const;
+    Tensor conv_transpose2d(const Tensor& weight, const Tensor* bias,
+                            int sH, int sW, int pH, int pW, int opH, int opW,
+                            int dH, int dW, int groups) const;
+    Tensor avg_pool2d(int kH, int kW, int sH, int sW, int pH, int pW, bool count_include_pad = true) const;
+    
+    Tensor interpolate(int target_size, int mode, bool align_corners = false) const;
+    
+    // Factory
     static Tensor from_array(const float* data, const Shape& shape);
-    static Tensor from_buffer(const float* data, int count, const Shape& shape);  // #14
-    static Tensor randn(const Shape& shape);  // #15
-    Tensor randn_like() const;                // #15
-    std::vector<float> to_array() const;
-    
-    // Int tensor support (for embedding indices)
+    static Tensor from_buffer(const float* data, int count, const Shape& shape);
+    static Tensor randn(const Shape& shape);
     static Tensor from_int_array(const int* data, const Shape& shape);
+    static Tensor full(const Shape& shape, float value);
+    static Tensor arange(float start, float end, float step = 1.0f);
+    Tensor randn_like() const;
+    std::vector<float> to_array() const;
 };
 
 }

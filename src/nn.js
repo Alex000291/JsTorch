@@ -157,7 +157,7 @@ class ConvTranspose1d extends Module {
     }
 }
 
-// ==================== Conv2d (for RMVPE) ====================
+// ==================== Conv2d ====================
 class Conv2d extends Module {
     constructor(in_channels, out_channels, kernel_size, {
         stride = 1, padding = 0, dilation = 1, groups = 1, bias = true
@@ -167,13 +167,51 @@ class Conv2d extends Module {
         const kw = Array.isArray(kernel_size) ? kernel_size[1] : kernel_size;
         this.stride = Array.isArray(stride) ? stride : [stride, stride];
         this.padding = Array.isArray(padding) ? padding : [padding, padding];
+        this.dilation = Array.isArray(dilation) ? dilation : [dilation, dilation];
+        this.groups = groups;
         this._parameters.weight = Tensor.randn([out_channels, in_channels / groups, kh, kw]);
         if (bias) this._parameters.bias = zeros([out_channels]);
     }
     
     forward(x) {
-        // TODO: implement when needed for RMVPE
-        throw new Error('Conv2d forward not yet implemented in CUDA');
+        const [sH, sW] = this.stride;
+        const [pH, pW] = this.padding;
+        const [dH, dW] = this.dilation;
+        return x.conv2d(
+            this._parameters.weight,
+            this._parameters.bias || null,
+            sH, sW, pH, pW, dH, dW, this.groups
+        );
+    }
+}
+
+// ==================== ConvTranspose2d ====================
+class ConvTranspose2d extends Module {
+    constructor(in_channels, out_channels, kernel_size, {
+        stride = 1, padding = 0, output_padding = 0, dilation = 1, groups = 1, bias = true
+    } = {}) {
+        super();
+        const kh = Array.isArray(kernel_size) ? kernel_size[0] : kernel_size;
+        const kw = Array.isArray(kernel_size) ? kernel_size[1] : kernel_size;
+        this.stride = Array.isArray(stride) ? stride : [stride, stride];
+        this.padding = Array.isArray(padding) ? padding : [padding, padding];
+        this.output_padding = Array.isArray(output_padding) ? output_padding : [output_padding, output_padding];
+        this.dilation = Array.isArray(dilation) ? dilation : [dilation, dilation];
+        this.groups = groups;
+        this._parameters.weight = Tensor.randn([in_channels, out_channels / groups, kh, kw]);
+        if (bias) this._parameters.bias = zeros([out_channels]);
+    }
+    
+    forward(x) {
+        const [sH, sW] = this.stride;
+        const [pH, pW] = this.padding;
+        const [opH, opW] = this.output_padding;
+        const [dH, dW] = this.dilation;
+        return x.conv_transpose2d(
+            this._parameters.weight,
+            this._parameters.bias || null,
+            sH, sW, pH, pW, opH, opW, dH, dW, this.groups
+        );
     }
 }
 
@@ -218,7 +256,164 @@ class BatchNorm1d extends Module {
     }
 }
 
-class BatchNorm2d extends BatchNorm1d {}
+class BatchNorm2d extends BatchNorm1d {
+    forward(x) {
+        // x: [B, C, H, W] -> reshape to [B, C, H*W], apply BN1d, reshape back
+        const [B, C, H, W] = x.shape;
+        const flat = x.reshape([B, C, H * W]);
+        const mean = this._buffers.running_mean.reshape([1, C, 1]);
+        const var_ = this._buffers.running_var.reshape([1, C, 1]);
+        const w = this._parameters.weight.reshape([1, C, 1]);
+        const b = this._parameters.bias.reshape([1, C, 1]);
+        const eps = Tensor.fromFlat([this.eps], [1]);
+        const out = flat.sub(mean).div(var_.add(eps).sqrt()).mul(w).add(b);
+        return out.reshape([B, C, H, W]);
+    }
+}
+
+// ==================== AvgPool2d ====================
+class AvgPool2d extends Module {
+    constructor(kernel_size, stride, padding = 0) {
+        super();
+        this.kH = Array.isArray(kernel_size) ? kernel_size[0] : kernel_size;
+        this.kW = Array.isArray(kernel_size) ? kernel_size[1] : kernel_size;
+        if (stride === undefined) stride = kernel_size;
+        this.sH = Array.isArray(stride) ? stride[0] : stride;
+        this.sW = Array.isArray(stride) ? stride[1] : stride;
+        this.pH = Array.isArray(padding) ? padding[0] : padding;
+        this.pW = Array.isArray(padding) ? padding[1] : padding;
+    }
+    forward(x) {
+        return x.avg_pool2d(this.kH, this.kW, this.sH, this.sW, this.pH, this.pW);
+    }
+}
+
+// ==================== Upsample ====================
+class Upsample extends Module {
+    constructor({ scale_factor, size, mode = 'nearest' } = {}) {
+        super();
+        this.scale_factor = scale_factor;
+        this.size = size;
+        this.mode = mode;
+    }
+    forward(x) {
+        const modeInt = this.mode === 'nearest' ? 0 : 1;
+        if (this.size !== undefined) return x.interpolate(this.size, modeInt);
+        const lastDim = x.shape[x.shape.length - 1];
+        return x.interpolate(Math.round(lastDim * this.scale_factor), modeInt);
+    }
+}
+
+// ==================== GroupNorm ====================
+class GroupNorm extends Module {
+    constructor(num_groups, num_channels, eps = 1e-5) {
+        super();
+        this.num_groups = num_groups;
+        this.num_channels = num_channels;
+        this.eps = eps;
+        this._parameters.weight = ones([num_channels]);
+        this._parameters.bias = zeros([num_channels]);
+    }
+    forward(x) {
+        // x: [B, C, ...]
+        const B = x.shape[0], C = x.shape[1];
+        const spatial = x.shape.reduce((a,b) => a*b, 1) / (B * C);
+        const G = this.num_groups;
+        const CpG = C / G;
+        // Reshape to [B, G, CpG * spatial]
+        const y = x.reshape([B, G, CpG * spatial]);
+        const mean = y.mean(2, true);
+        const variance = y.sub(mean).pow(2).mean(2, true);
+        const eps = Tensor.fromFlat([this.eps], [1]);
+        const normed = y.sub(mean).div(variance.add(eps).sqrt());
+        const out = normed.reshape([B, C, ...x.shape.slice(2)]);
+        // Apply weight and bias per channel
+        const w = this._parameters.weight.reshape([1, C, ...Array(x.shape.length - 2).fill(1)]);
+        const b = this._parameters.bias.reshape([1, C, ...Array(x.shape.length - 2).fill(1)]);
+        return out.mul(w).add(b);
+    }
+}
+
+// ==================== GRU ====================
+class GRU extends Module {
+    constructor(input_size, hidden_size, { num_layers = 1, bidirectional = false, batch_first = false } = {}) {
+        super();
+        this.input_size = input_size;
+        this.hidden_size = hidden_size;
+        this.num_layers = num_layers;
+        this.bidirectional = bidirectional;
+        this.batch_first = batch_first;
+        const num_dir = bidirectional ? 2 : 1;
+        for (let l = 0; l < num_layers; l++) {
+            const in_sz = l === 0 ? input_size : hidden_size * num_dir;
+            // PyTorch-compatible parameter names
+            this._parameters[`weight_ih_l${l}`] = Tensor.randn([3 * hidden_size, in_sz]);
+            this._parameters[`weight_hh_l${l}`] = Tensor.randn([3 * hidden_size, hidden_size]);
+            this._parameters[`bias_ih_l${l}`] = zeros([3 * hidden_size]);
+            this._parameters[`bias_hh_l${l}`] = zeros([3 * hidden_size]);
+            if (bidirectional) {
+                this._parameters[`weight_ih_l${l}_reverse`] = Tensor.randn([3 * hidden_size, in_sz]);
+                this._parameters[`weight_hh_l${l}_reverse`] = Tensor.randn([3 * hidden_size, hidden_size]);
+                this._parameters[`bias_ih_l${l}_reverse`] = zeros([3 * hidden_size]);
+                this._parameters[`bias_hh_l${l}_reverse`] = zeros([3 * hidden_size]);
+            }
+        }
+    }
+    
+    _cell(x, h, wih, whh, bih, bhh) {
+        // x: [batch, in], h: [batch, hidden]
+        const hs = this.hidden_size;
+        const gi = x.matmul(wih.transpose()).add(bih);
+        const gh = h.matmul(whh.transpose()).add(bhh);
+        const r = gi.slice(1, 0, hs).add(gh.slice(1, 0, hs)).sigmoid();
+        const z = gi.slice(1, hs, 2*hs).add(gh.slice(1, hs, 2*hs)).sigmoid();
+        const n = gi.slice(1, 2*hs, 3*hs).add(r.mul(gh.slice(1, 2*hs, 3*hs))).tanh();
+        return Tensor.ones([...z.shape]).sub(z).mul(n).add(z.mul(h));
+    }
+    
+    _run_direction(input, seqLen, batch, layerIdx, suffix = '') {
+        const reverse = suffix === '_reverse';
+        const wih = this._parameters[`weight_ih_l${layerIdx}${suffix}`];
+        const whh = this._parameters[`weight_hh_l${layerIdx}${suffix}`];
+        const bih = this._parameters[`bias_ih_l${layerIdx}${suffix}`];
+        const bhh = this._parameters[`bias_hh_l${layerIdx}${suffix}`];
+        let h = Tensor.zeros([batch, this.hidden_size]);
+        const outputs = [];
+        const start = reverse ? seqLen - 1 : 0;
+        const end = reverse ? -1 : seqLen;
+        const step = reverse ? -1 : 1;
+        for (let t = start; t !== end; t += step) {
+            const xt = input.slice(0, t, t + 1).squeeze(0);
+            h = this._cell(xt, h, wih, whh, bih, bhh);
+            if (reverse) outputs.unshift(h.unsqueeze(0));
+            else outputs.push(h.unsqueeze(0));
+        }
+        return { output: Tensor.cat(outputs, 0), h };
+    }
+    
+    forward(x, h0 = null) {
+        // x: [seq, batch, features] or [batch, seq, features] if batch_first
+        if (this.batch_first) x = x.transpose(0, 1);
+        const seqLen = x.shape[0], batch = x.shape[1];
+        let input = x;
+        const hResults = [];
+        
+        for (let l = 0; l < this.num_layers; l++) {
+            const fwd = this._run_direction(input, seqLen, batch, l);
+            hResults.push(fwd.h.unsqueeze(0));
+            if (this.bidirectional) {
+                const rev = this._run_direction(input, seqLen, batch, l, '_reverse');
+                input = Tensor.cat([fwd.output, rev.output], 2);
+                hResults.push(rev.h.unsqueeze(0));
+            } else {
+                input = fwd.output;
+            }
+        }
+        let output = input;
+        if (this.batch_first) output = output.transpose(0, 1);
+        return [output, Tensor.cat(hResults, 0)];
+    }
+}
 
 // ==================== #26 Activations ====================
 class LeakyReLU extends Module {
@@ -313,8 +508,10 @@ const F = {
 
 // ==================== Export ====================
 export const nn = {
-    Module, Linear, Embedding, Conv1d, ConvTranspose1d, Conv2d,
-    LayerNorm, BatchNorm1d, BatchNorm2d,
+    Module, Linear, Embedding,
+    Conv1d, ConvTranspose1d, Conv2d, ConvTranspose2d,
+    AvgPool2d, Upsample, GRU,
+    LayerNorm, GroupNorm, BatchNorm1d, BatchNorm2d,
     ReLU, LeakyReLU, Sigmoid, Tanh, GELU, SiLU, Dropout,
     Sequential, ModuleList,
     weight_norm, remove_weight_norm,

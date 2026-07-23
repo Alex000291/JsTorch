@@ -76,6 +76,7 @@ public: // data_ needs friend access from static methods
             InstanceMethod("slice", &TensorWrap::Slice),
             InstanceMethod("contiguous", &TensorWrap::Contiguous),
             InstanceMethod("clone", &TensorWrap::Clone),
+            InstanceMethod("flatten", &TensorWrap::Flatten),
             
             // Unary ops
             InstanceMethod("abs", &TensorWrap::abs),
@@ -97,6 +98,15 @@ public: // data_ needs friend access from static methods
             InstanceMethod("softplus", &TensorWrap::softplus),
             InstanceMethod("leaky_relu", &TensorWrap::leaky_relu),
             InstanceMethod("clamp", &TensorWrap::Clamp),
+            InstanceMethod("clamp_min", &TensorWrap::ClampMin),
+            InstanceMethod("clamp_max", &TensorWrap::ClampMax),
+            InstanceMethod("fmod", &TensorWrap::Fmod),
+            InstanceMethod("log1p", &TensorWrap::log1p_),
+            InstanceMethod("reciprocal", &TensorWrap::reciprocal_),
+            InstanceMethod("sign", &TensorWrap::sign_),
+            InstanceMethod("pow_scalar", &TensorWrap::PowScalar),
+            InstanceMethod("mul_scalar", &TensorWrap::MulScalar),
+            InstanceMethod("add_scalar", &TensorWrap::AddScalar),
             
             // Binary ops
             InstanceMethod("add", &TensorWrap::add),
@@ -117,6 +127,10 @@ public: // data_ needs friend access from static methods
             // Reduce
             InstanceMethod("sum", &TensorWrap::Sum),
             InstanceMethod("mean", &TensorWrap::Mean),
+            InstanceMethod("max", &TensorWrap::Max),
+            InstanceMethod("min", &TensorWrap::Min),
+            InstanceMethod("argmax", &TensorWrap::Argmax),
+            InstanceMethod("argmin", &TensorWrap::Argmin),
             
             // Tensor ops
             InstanceMethod("flip", &TensorWrap::Flip),
@@ -127,6 +141,9 @@ public: // data_ needs friend access from static methods
             InstanceMethod("conv_transpose1d", &TensorWrap::ConvTranspose1d),
             InstanceMethod("interpolate", &TensorWrap::Interpolate),
             InstanceMethod("randn_like", &TensorWrap::RandnLike),
+            InstanceMethod("conv2d", &TensorWrap::Conv2d_),
+            InstanceMethod("conv_transpose2d", &TensorWrap::ConvTranspose2d_),
+            InstanceMethod("avg_pool2d", &TensorWrap::AvgPool2d),
             
             // Static methods
             StaticMethod("cat", &TensorWrap::Cat),
@@ -134,6 +151,8 @@ public: // data_ needs friend access from static methods
             StaticMethod("fromBuffer", &TensorWrap::FromBuffer),
             StaticMethod("randn", &TensorWrap::Randn),
             StaticMethod("fromIntArray", &TensorWrap::FromIntArray),
+            StaticMethod("full", &TensorWrap::Full),
+            StaticMethod("arange", &TensorWrap::Arange),
         });
         
         auto* ctor = new Napi::FunctionReference();
@@ -214,6 +233,7 @@ public: // data_ needs friend access from static methods
     DEF_UNARY(ceil_, ceil)    DEF_UNARY(round_, round)   DEF_UNARY(sigmoid, sigmoid)
     DEF_UNARY(tanh_, tanh)    DEF_UNARY(relu, relu)      DEF_UNARY(silu, silu)
     DEF_UNARY(gelu, gelu)     DEF_UNARY(softplus, softplus)
+    DEF_UNARY(log1p_, log1p)  DEF_UNARY(reciprocal_, reciprocal) DEF_UNARY(sign_, sign)
     DEF_UNARY(RandnLike, randn_like)
     
     Napi::Value leaky_relu(const Napi::CallbackInfo& info) {
@@ -225,17 +245,71 @@ public: // data_ needs friend access from static methods
         float hi = info[1].As<Napi::Number>().FloatValue();
         return Wrap(info.Env(), tensor_.clamp(lo, hi));
     }
+    Napi::Value ClampMin(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), tensor_.clamp_min(info[0].As<Napi::Number>().FloatValue()));
+    }
+    Napi::Value ClampMax(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), tensor_.clamp_max(info[0].As<Napi::Number>().FloatValue()));
+    }
+    Napi::Value Fmod(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), tensor_.fmod(info[0].As<Napi::Number>().FloatValue()));
+    }
+    Napi::Value PowScalar(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), tensor_.pow_scalar(info[0].As<Napi::Number>().FloatValue()));
+    }
+    Napi::Value MulScalar(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), tensor_.mul_scalar(info[0].As<Napi::Number>().FloatValue()));
+    }
+    Napi::Value AddScalar(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), tensor_.add_scalar(info[0].As<Napi::Number>().FloatValue()));
+    }
 
     // ==================== Binary ops (macro) ====================
     #define DEF_BINARY(jsName, cppName) \
     Napi::Value jsName(const Napi::CallbackInfo& info) { \
+        if (info[0].IsNumber()) { \
+            float s = info[0].As<Napi::Number>().FloatValue(); \
+            auto scalar = Tensor::from_array(&s, {1}); \
+            return Wrap(info.Env(), tensor_.cppName(scalar)); \
+        } \
         auto* other = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>()); \
         return Wrap(info.Env(), tensor_.cppName(other->tensor())); \
     }
     
-    DEF_BINARY(add, add)     DEF_BINARY(sub, sub)     DEF_BINARY(mul, mul)
-    DEF_BINARY(div_, div)    DEF_BINARY(maximum, maximum) DEF_BINARY(minimum, minimum)
-    DEF_BINARY(pow_, pow)    DEF_BINARY(gt, gt)       DEF_BINARY(lt, lt)
+    // Optimized scalar ops: mul/add/pow use dedicated kernels
+    Napi::Value mul(const Napi::CallbackInfo& info) {
+        if (info[0].IsNumber())
+            return Wrap(info.Env(), tensor_.mul_scalar(info[0].As<Napi::Number>().FloatValue()));
+        auto* o = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        return Wrap(info.Env(), tensor_.mul(o->tensor()));
+    }
+    Napi::Value add(const Napi::CallbackInfo& info) {
+        if (info[0].IsNumber())
+            return Wrap(info.Env(), tensor_.add_scalar(info[0].As<Napi::Number>().FloatValue()));
+        auto* o = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        return Wrap(info.Env(), tensor_.add(o->tensor()));
+    }
+    Napi::Value sub(const Napi::CallbackInfo& info) {
+        if (info[0].IsNumber())
+            return Wrap(info.Env(), tensor_.add_scalar(-info[0].As<Napi::Number>().FloatValue()));
+        auto* o = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        return Wrap(info.Env(), tensor_.sub(o->tensor()));
+    }
+    Napi::Value div_(const Napi::CallbackInfo& info) {
+        if (info[0].IsNumber())
+            return Wrap(info.Env(), tensor_.mul_scalar(1.0f / info[0].As<Napi::Number>().FloatValue()));
+        auto* o = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        return Wrap(info.Env(), tensor_.div(o->tensor()));
+    }
+    Napi::Value pow_(const Napi::CallbackInfo& info) {
+        if (info[0].IsNumber())
+            return Wrap(info.Env(), tensor_.pow_scalar(info[0].As<Napi::Number>().FloatValue()));
+        auto* o = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        return Wrap(info.Env(), tensor_.pow(o->tensor()));
+    }
+    
+    DEF_BINARY(maximum, maximum) DEF_BINARY(minimum, minimum)
+    DEF_BINARY(gt, gt)       DEF_BINARY(lt, lt)
     DEF_BINARY(ge, ge)       DEF_BINARY(le, le)       DEF_BINARY(eq_, eq)
     DEF_BINARY(ne_, ne)      DEF_BINARY(Matmul, matmul)
 
@@ -249,6 +323,28 @@ public: // data_ needs friend access from static methods
         int dim = info.Length() > 0 ? info[0].As<Napi::Number>().Int32Value() : -1;
         bool keepdim = info.Length() > 1 ? info[1].As<Napi::Boolean>().Value() : false;
         return Wrap(info.Env(), tensor_.mean(dim, keepdim));
+    }
+
+    Napi::Value Max(const Napi::CallbackInfo& info) {
+        int dim = info[0].As<Napi::Number>().Int32Value();
+        bool keepdim = info.Length() > 1 ? info[1].As<Napi::Boolean>().Value() : false;
+        return Wrap(info.Env(), tensor_.max(dim, keepdim));
+    }
+    Napi::Value Min(const Napi::CallbackInfo& info) {
+        int dim = info[0].As<Napi::Number>().Int32Value();
+        bool keepdim = info.Length() > 1 ? info[1].As<Napi::Boolean>().Value() : false;
+        return Wrap(info.Env(), tensor_.min(dim, keepdim));
+    }
+    Napi::Value Argmax(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), tensor_.argmax(info[0].As<Napi::Number>().Int32Value()));
+    }
+    Napi::Value Argmin(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), tensor_.argmin(info[0].As<Napi::Number>().Int32Value()));
+    }
+    Napi::Value Flatten(const Napi::CallbackInfo& info) {
+        int start = info[0].As<Napi::Number>().Int32Value();
+        int end = info.Length() > 1 ? info[1].As<Napi::Number>().Int32Value() : -1;
+        return Wrap(info.Env(), tensor_.flatten(start, end));
     }
 
     // ==================== Tensor ops ====================
@@ -308,6 +404,53 @@ public: // data_ needs friend access from static methods
         return Wrap(info.Env(), tensor_.conv_transpose1d(w->tensor(), bias_ptr, stride, padding, output_padding, dilation, groups));
     }
     
+    Napi::Value Conv2d_(const Napi::CallbackInfo& info) {
+        auto* w = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        const Tensor* bias_ptr = nullptr; Tensor bias_t(Shape{1});
+        if (!info[1].IsNull() && !info[1].IsUndefined()) {
+            bias_t = Napi::ObjectWrap<TensorWrap>::Unwrap(info[1].As<Napi::Object>())->tensor();
+            bias_ptr = &bias_t;
+        }
+        int sH = info[2].As<Napi::Number>().Int32Value();
+        int sW = info[3].As<Napi::Number>().Int32Value();
+        int pH = info[4].As<Napi::Number>().Int32Value();
+        int pW = info[5].As<Napi::Number>().Int32Value();
+        int dH = info[6].As<Napi::Number>().Int32Value();
+        int dW = info[7].As<Napi::Number>().Int32Value();
+        int groups = info[8].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), tensor_.conv2d(w->tensor(), bias_ptr, sH, sW, pH, pW, dH, dW, groups));
+    }
+    
+    Napi::Value ConvTranspose2d_(const Napi::CallbackInfo& info) {
+        auto* w = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        const Tensor* bias_ptr = nullptr; Tensor bias_t(Shape{1});
+        if (!info[1].IsNull() && !info[1].IsUndefined()) {
+            bias_t = Napi::ObjectWrap<TensorWrap>::Unwrap(info[1].As<Napi::Object>())->tensor();
+            bias_ptr = &bias_t;
+        }
+        int sH = info[2].As<Napi::Number>().Int32Value();
+        int sW = info[3].As<Napi::Number>().Int32Value();
+        int pH = info[4].As<Napi::Number>().Int32Value();
+        int pW = info[5].As<Napi::Number>().Int32Value();
+        int opH = info[6].As<Napi::Number>().Int32Value();
+        int opW = info[7].As<Napi::Number>().Int32Value();
+        int dH = info[8].As<Napi::Number>().Int32Value();
+        int dW = info[9].As<Napi::Number>().Int32Value();
+        int groups = info[10].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), tensor_.conv_transpose2d(w->tensor(), bias_ptr, sH, sW, pH, pW, opH, opW, dH, dW, groups));
+    }
+    
+    Napi::Value AvgPool2d(const Napi::CallbackInfo& info) {
+        int kH = info[0].As<Napi::Number>().Int32Value();
+        int kW = info[1].As<Napi::Number>().Int32Value();
+        int sH = info[2].As<Napi::Number>().Int32Value();
+        int sW = info[3].As<Napi::Number>().Int32Value();
+        int pH = info[4].As<Napi::Number>().Int32Value();
+        int pW = info[5].As<Napi::Number>().Int32Value();
+        bool cip = info.Length() > 6 ? info[6].As<Napi::Boolean>().Value() : true;
+        return Wrap(info.Env(), tensor_.avg_pool2d(kH, kW, sH, sW, pH, pW, cip));
+    }
+    
     Napi::Value Interpolate(const Napi::CallbackInfo& info) {
         int target = info[0].As<Napi::Number>().Int32Value();
         int mode = info.Length() > 1 ? info[1].As<Napi::Number>().Int32Value() : 0;
@@ -342,6 +485,19 @@ public: // data_ needs friend access from static methods
     
     static Napi::Value Randn(const Napi::CallbackInfo& info) {
         return Wrap(info.Env(), Tensor::randn(parseShape(info, 0)));
+    }
+    
+    static Napi::Value Full(const Napi::CallbackInfo& info) {
+        Shape shape = parseShape(info, 0);
+        float value = info[1].As<Napi::Number>().FloatValue();
+        return Wrap(info.Env(), Tensor::full(shape, value));
+    }
+    
+    static Napi::Value Arange(const Napi::CallbackInfo& info) {
+        float start = info[0].As<Napi::Number>().FloatValue();
+        float end = info[1].As<Napi::Number>().FloatValue();
+        float step = info.Length() > 2 ? info[2].As<Napi::Number>().FloatValue() : 1.0f;
+        return Wrap(info.Env(), Tensor::arange(start, end, step));
     }
     
     static Napi::Value FromIntArray(const Napi::CallbackInfo& info) {
