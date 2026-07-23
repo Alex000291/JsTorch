@@ -26,6 +26,16 @@ extern "C" {
     void launch_log(const float* input, float* output, int size, cudaStream_t stream);
     void launch_neg(const float* input, float* output, int size, cudaStream_t stream);
     void launch_sum(const float* input, float* output, int size, cudaStream_t stream);
+    void launch_conv2d(const float* input, const float* weight, const float* bias, float* output,
+                      int batch, int in_channels, int out_channels,
+                      int input_h, int input_w, int kernel_h, int kernel_w,
+                      int stride_h, int stride_w, int padding_h, int padding_w,
+                      int output_h, int output_w, cudaStream_t stream);
+    void launch_maxpool2d(const float* input, float* output,
+                         int batch, int channels, int input_h, int input_w,
+                         int kernel_h, int kernel_w, int stride_h, int stride_w,
+                         int padding_h, int padding_w, int output_h, int output_w,
+                         cudaStream_t stream);
 }
 
 // ==================== Tensor Class ====================
@@ -84,6 +94,8 @@ public:
             InstanceMethod("mean", &Tensor::Mean),
             InstanceMethod("item", &Tensor::Item),
             InstanceMethod("toArray", &Tensor::ToArray),
+            InstanceMethod("conv2d", &Tensor::Conv2D),
+            InstanceMethod("maxpool2d", &Tensor::MaxPool2D),
             InstanceAccessor("shape", &Tensor::GetShape, nullptr),
             InstanceAccessor("size", &Tensor::GetSize, nullptr),
         });
@@ -636,6 +648,98 @@ Napi::Value Ones(const Napi::CallbackInfo& info) {
 }
 
 // ==================== Module Initialization ====================
+
+    // Conv2D
+    // input: this tensor [batch, in_channels, height, width]
+    // weight: [out_channels, in_channels, kernel_h, kernel_w]
+    // bias: [out_channels] or null
+    // Returns: [batch, out_channels, out_h, out_w]
+    Napi::Value Conv2D(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        
+        // Parse arguments: weight, bias (optional), stride, padding
+        Tensor* weight = Tensor::Unwrap(info[0].As<Napi::Object>());
+        Tensor* bias = info[1].IsNull() ? nullptr : Tensor::Unwrap(info[1].As<Napi::Object>());
+        
+        int stride_h = info[2].As<Napi::Number>().Int32Value();
+        int stride_w = info[3].As<Napi::Number>().Int32Value();
+        int padding_h = info[4].As<Napi::Number>().Int32Value();
+        int padding_w = info[5].As<Napi::Number>().Int32Value();
+        
+        // Input shape: [batch, in_channels, height, width]
+        int batch = shape_[0];
+        int in_channels = shape_[1];
+        int input_h = shape_[2];
+        int input_w = shape_[3];
+        
+        // Weight shape: [out_channels, in_channels, kernel_h, kernel_w]
+        int out_channels = weight->shape_[0];
+        int kernel_h = weight->shape_[2];
+        int kernel_w = weight->shape_[3];
+        
+        // Calculate output dimensions
+        int output_h = (input_h + 2 * padding_h - kernel_h) / stride_h + 1;
+        int output_w = (input_w + 2 * padding_w - kernel_w) / stride_w + 1;
+        
+        // Create output tensor
+        std::vector<int> out_shape = {batch, out_channels, output_h, output_w};
+        Tensor* result = createTensorWithShape(env, out_shape);
+        
+        // Launch kernel
+        launch_conv2d(
+            d_data_, weight->d_data_, bias ? bias->d_data_ : nullptr, result->d_data_,
+            batch, in_channels, out_channels,
+            input_h, input_w, kernel_h, kernel_w,
+            stride_h, stride_w, padding_h, padding_w,
+            output_h, output_w, stream_
+        );
+        
+        cudaStreamSynchronize(stream_);
+        
+        return result->Value();
+    }
+    
+    // MaxPool2D
+    // input: this tensor [batch, channels, height, width]
+    // Returns: [batch, channels, out_h, out_w]
+    Napi::Value MaxPool2D(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        
+        // Parse arguments: kernel_size, stride, padding
+        int kernel_h = info[0].As<Napi::Number>().Int32Value();
+        int kernel_w = info[1].As<Napi::Number>().Int32Value();
+        int stride_h = info[2].As<Napi::Number>().Int32Value();
+        int stride_w = info[3].As<Napi::Number>().Int32Value();
+        int padding_h = info[4].As<Napi::Number>().Int32Value();
+        int padding_w = info[5].As<Napi::Number>().Int32Value();
+        
+        // Input shape: [batch, channels, height, width]
+        int batch = shape_[0];
+        int channels = shape_[1];
+        int input_h = shape_[2];
+        int input_w = shape_[3];
+        
+        // Calculate output dimensions
+        int output_h = (input_h + 2 * padding_h - kernel_h) / stride_h + 1;
+        int output_w = (input_w + 2 * padding_w - kernel_w) / stride_w + 1;
+        
+        // Create output tensor
+        std::vector<int> out_shape = {batch, channels, output_h, output_w};
+        Tensor* result = createTensorWithShape(env, out_shape);
+        
+        // Launch kernel
+        launch_maxpool2d(
+            d_data_, result->d_data_,
+            batch, channels,
+            input_h, input_w, kernel_h, kernel_w,
+            stride_h, stride_w, padding_h, padding_w,
+            output_h, output_w, stream_
+        );
+        
+        cudaStreamSynchronize(stream_);
+        
+        return result->Value();
+    }
 
 // Cleanup function for module unload
 static void CleanupCublas() {

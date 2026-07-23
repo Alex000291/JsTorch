@@ -15,12 +15,12 @@ export function linear(in_features, out_features, bias = true) {
   );
   
   const weight = tensor(weight_data, true);
-  const bias_tensor = bias ? tensor(Array(out_features).fill(0), true) : null;
+  const bias_tensor = bias ? tensor([Array(out_features).fill(0)], true) : null;  // Shape: [1, out_features]
   
   return {
     forward: (x) => {
       // y = x @ W^T + b
-      const out = x.matmul(weight);
+      const out = x.matmul(weight.transpose());
       return bias_tensor ? out.add(bias_tensor) : out;
     },
     
@@ -43,6 +43,62 @@ export function flatten(start_dim = 0, end_dim = -1) {
     forward: (x) => {
       // For now, assume already flat for MLP
       return x;
+    },
+    parameters: () => []
+  };
+}
+
+// Conv2D Layer
+export function conv2d(in_channels, out_channels, kernel_size, stride = 1, padding = 0, bias = true) {
+  const kernel_h = Array.isArray(kernel_size) ? kernel_size[0] : kernel_size;
+  const kernel_w = Array.isArray(kernel_size) ? kernel_size[1] : kernel_size;
+  const stride_h = Array.isArray(stride) ? stride[0] : stride;
+  const stride_w = Array.isArray(stride) ? stride[1] : stride;
+  const padding_h = Array.isArray(padding) ? padding[0] : padding;
+  const padding_w = Array.isArray(padding) ? padding[1] : padding;
+  
+  // Kaiming initialization for conv weights
+  const n = in_channels * kernel_h * kernel_w;
+  const std = Math.sqrt(2.0 / n);
+  
+  // Weight shape: [out_channels, in_channels, kernel_h, kernel_w]
+  const weight_data = Array.from({ length: out_channels }, () =>
+    Array.from({ length: in_channels }, () =>
+      Array.from({ length: kernel_h }, () =>
+        Array.from({ length: kernel_w }, () => (Math.random() * 2 - 1) * std)
+      )
+    )
+  );
+  
+  const weight = tensor(weight_data, true);
+  const bias_tensor = bias ? tensor([Array(out_channels).fill(0)], true) : null;
+  
+  return {
+    forward: (x) => {
+      // x: [batch, in_channels, height, width]
+      const out = x.conv2d(weight, bias_tensor, stride_h, stride_w, padding_h, padding_w);
+      return out;
+    },
+    
+    parameters: () => bias_tensor ? [weight, bias_tensor] : [weight],
+    
+    weight,
+    bias: bias_tensor
+  };
+}
+
+// MaxPool2D Layer
+export function maxpool2d(kernel_size, stride = null, padding = 0) {
+  const kernel_h = Array.isArray(kernel_size) ? kernel_size[0] : kernel_size;
+  const kernel_w = Array.isArray(kernel_size) ? kernel_size[1] : kernel_size;
+  const stride_h = stride ? (Array.isArray(stride) ? stride[0] : stride) : kernel_h;
+  const stride_w = stride ? (Array.isArray(stride) ? stride[1] : stride) : kernel_w;
+  const padding_h = Array.isArray(padding) ? padding[0] : padding;
+  const padding_w = Array.isArray(padding) ? padding[1] : padding;
+  
+  return {
+    forward: (x) => {
+      return x.maxpool2d(kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w);
     },
     parameters: () => []
   };

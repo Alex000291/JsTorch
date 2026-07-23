@@ -4,3 +4,7 @@ build/win/dlls/
 build/win/libs/
 native/cpp_obj/
 native/cu_obj/
+
+examples
+
+test
