@@ -138,6 +138,80 @@ __global__ void cat_kernel(const float* src, float* dst,
     dst[(o * dst_dim + (d + dst_offset)) * inner + i] = src[idx];
 }
 
+// === scatter_add (embedding backward) ===
+// grad_output: [num_indices, embed_dim], indices: [num_indices]
+// grad_weight: [vocab_size, embed_dim] — atomicAdd because indices can repeat
+__global__ void scatter_add_kernel(const float* grad, const int* indices,
+    float* grad_weight, int num_indices, int embed_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_indices * embed_dim) return;
+    int row = idx / embed_dim, col = idx % embed_dim;
+    atomicAdd(&grad_weight[indices[row] * embed_dim + col], grad[idx]);
+}
+
+// === interp1d backward ===
+// Nearest: each output grad goes to exactly one input position
+__global__ void interp1d_backward_nearest_kernel(const float* grad_out, float* grad_in,
+    int batch_channels, int in_len, int out_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_channels * out_len) return;
+    int bc = idx / out_len, out_i = idx % out_len;
+    float scale = (float)in_len / (float)out_len;
+    int in_i = min((int)(out_i * scale), in_len - 1);
+    atomicAdd(&grad_in[bc * in_len + in_i], grad_out[idx]);
+}
+
+// Linear: distribute grad to two neighboring input positions
+__global__ void interp1d_backward_linear_kernel(const float* grad_out, float* grad_in,
+    int batch_channels, int in_len, int out_len, bool align_corners) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_channels * out_len) return;
+    int bc = idx / out_len, out_i = idx % out_len;
+    float src;
+    if (align_corners && out_len > 1)
+        src = (float)out_i * (float)(in_len - 1) / (float)(out_len - 1);
+    else
+        src = ((float)out_i + 0.5f) * (float)in_len / (float)out_len - 0.5f;
+    src = fmaxf(0.0f, fminf(src, (float)(in_len - 1)));
+    int lo = (int)src;
+    int hi = min(lo + 1, in_len - 1);
+    float t = src - (float)lo;
+    float g = grad_out[idx];
+    atomicAdd(&grad_in[bc * in_len + lo], g * (1.0f - t));
+    atomicAdd(&grad_in[bc * in_len + hi], g * t);
+}
+
+// === avgpool2d backward ===
+// Distribute grad_output / (kH*kW) back to each contributing input position
+__global__ void avgpool2d_backward_kernel(const float* grad_out, float* grad_in,
+    int B, int C, int H, int W, int kH, int kW, int sH, int sW,
+    int pH, int pW, int Ho, int Wo, bool count_include_pad) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * C * Ho * Wo;
+    if (idx >= total) return;
+    int b = idx / (C*Ho*Wo);
+    int r = idx % (C*Ho*Wo);
+    int c = r / (Ho*Wo); r %= Ho*Wo;
+    int ho = r / Wo, wo = r % Wo;
+    int cnt = 0;
+    if (!count_include_pad) {
+        for (int kh = 0; kh < kH; kh++)
+            for (int kw = 0; kw < kW; kw++) {
+                int hi = ho*sH - pH + kh, wi = wo*sW - pW + kw;
+                if (hi >= 0 && hi < H && wi >= 0 && wi < W) cnt++;
+            }
+        cnt = max(cnt, 1);
+    } else cnt = kH * kW;
+    float g = grad_out[idx] / (float)cnt;
+    for (int kh = 0; kh < kH; kh++) {
+        for (int kw = 0; kw < kW; kw++) {
+            int hi = ho*sH - pH + kh, wi = wo*sW - pW + kw;
+            if (hi >= 0 && hi < H && wi >= 0 && wi < W)
+                atomicAdd(&grad_in[((b*C+c)*H+hi)*W+wi], g);
+        }
+    }
+}
+
 // ==================== extern "C" launchers ====================
 extern "C" {
 
@@ -186,6 +260,33 @@ void launch_cat(const float* src, float* dst,
     int outer, int src_dim, int dst_dim, int inner, int dst_offset, cudaStream_t s) {
     int total = outer * src_dim * inner;
     cat_kernel<<<(total+255)/256, 256, 0, s>>>(src, dst, outer, src_dim, dst_dim, inner, dst_offset);
+}
+
+void launch_scatter_add(const float* grad, const int* indices,
+    float* grad_weight, int num_indices, int embed_dim, int vocab_size, cudaStream_t s) {
+    // Zero grad_weight first
+    cudaMemsetAsync(grad_weight, 0, vocab_size * embed_dim * sizeof(float), s);
+    int total = num_indices * embed_dim;
+    scatter_add_kernel<<<(total+255)/256, 256, 0, s>>>(grad, indices, grad_weight, num_indices, embed_dim);
+}
+
+void launch_interp1d_backward(const float* grad_out, float* grad_in,
+    int batch_channels, int in_len, int out_len, int mode, bool align_corners, cudaStream_t s) {
+    cudaMemsetAsync(grad_in, 0, batch_channels * in_len * sizeof(float), s);
+    int total = batch_channels * out_len;
+    if (mode == 0)
+        interp1d_backward_nearest_kernel<<<(total+255)/256, 256, 0, s>>>(grad_out, grad_in, batch_channels, in_len, out_len);
+    else
+        interp1d_backward_linear_kernel<<<(total+255)/256, 256, 0, s>>>(grad_out, grad_in, batch_channels, in_len, out_len, align_corners);
+}
+
+void launch_avgpool2d_backward(const float* grad_out, float* grad_in,
+    int B, int C, int H, int W, int kH, int kW, int sH, int sW,
+    int pH, int pW, int Ho, int Wo, bool count_include_pad, cudaStream_t s) {
+    cudaMemsetAsync(grad_in, 0, B * C * H * W * sizeof(float), s);
+    int total = B * C * Ho * Wo;
+    avgpool2d_backward_kernel<<<(total+255)/256, 256, 0, s>>>(
+        grad_out, grad_in, B, C, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo, count_include_pad);
 }
 
 }

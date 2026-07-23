@@ -48,7 +48,15 @@ struct ClampOp { float lo, hi; __device__ float operator()(float x) const { retu
 struct FmodOp { float d; __device__ float operator()(float x) const { return fmodf(x, d); } };
 struct ClampMinOp { float lo; __device__ float operator()(float x) const { return fmaxf(x, lo); } };
 struct ClampMaxOp { float hi; __device__ float operator()(float x) const { return fminf(x, hi); } };
-struct PowScalarOp { float e; __device__ float operator()(float x) const { return powf(x, e); } };
+struct PowScalarOp { float e; __device__ float operator()(float x) const {
+    // powf(negative, e) is NaN for non-integer e; handle sign correctly
+    if (x >= 0.0f) return powf(x, e);
+    float r = powf(-x, e);
+    // Negative base: result is negative if e is odd integer, positive if even, NaN otherwise
+    int ie = (int)e;
+    if ((float)ie == e) return (ie % 2 != 0) ? -r : r;
+    return __int_as_float(0x7FC00000); // NaN for fractional e with negative base
+} };
 struct MulScalarOp { float s; __device__ float operator()(float x) const { return x * s; } };
 struct AddScalarOp { float s; __device__ float operator()(float x) const { return x + s; } };
 

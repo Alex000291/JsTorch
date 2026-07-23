@@ -1,5 +1,6 @@
 // nn.js - Neural network modules for RVC
 import { Tensor, zeros, ones } from './tensor.js';
+import { GradTensor } from './autograd.js';
 
 // ==================== #27 Module base ====================
 class Module {
@@ -12,11 +13,29 @@ class Module {
     
     parameters() {
         const params = [];
-        for (const p of Object.values(this._parameters)) params.push(p);
+        for (const p of Object.values(this._parameters)) {
+            if (p instanceof GradTensor) params.push(p);
+            else if (p) params.push(p); // native.Tensor — kept for backward compat
+        }
         for (const m of Object.values(this._modules)) {
             if (m && m.parameters) params.push(...m.parameters());
         }
         return params;
+    }
+    
+    // Convert all parameters to GradTensor with requires_grad=true
+    _init_grad() {
+        for (const [name, p] of Object.entries(this._parameters)) {
+            if (p && !(p instanceof GradTensor)) {
+                this._parameters[name] = new GradTensor(p, true);
+            } else if (p instanceof GradTensor) {
+                p.requires_grad = true;
+            }
+        }
+        for (const m of Object.values(this._modules)) {
+            if (m && m._init_grad) m._init_grad();
+        }
+        return this;
     }
     
     train(mode = true) {

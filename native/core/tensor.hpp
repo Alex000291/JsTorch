@@ -136,6 +136,19 @@ public:
     
     Tensor interpolate(int target_size, int mode, bool align_corners = false) const;
     
+    // Backward ops
+    Tensor scatter_add(const Tensor& grad, const Tensor& indices, int vocab_size) const;
+    Tensor interp1d_backward(int in_len, int mode, bool align_corners) const;
+    Tensor avgpool2d_backward(int H, int W, int kH, int kW, int sH, int sW, int pH, int pW, bool count_include_pad) const;
+    static Tensor conv1d_backward_weight(const Tensor& input, const Tensor& grad_output,
+        int C_in_g, int K, int stride, int padding, int dilation, int groups);
+    static Tensor conv2d_backward_weight(const Tensor& input, const Tensor& grad_output,
+        int Ci_g, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int groups);
+    static Tensor conv_transpose1d_backward_weight(const Tensor& input, const Tensor& grad_output,
+        int C_out_g, int K, int stride, int padding, int dilation, int groups);
+    static Tensor conv_transpose2d_backward_weight(const Tensor& input, const Tensor& grad_output,
+        int Co_g, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int groups);
+    
     // Factory
     static Tensor from_array(const float* data, const Shape& shape);
     static Tensor from_buffer(const float* data, int count, const Shape& shape);

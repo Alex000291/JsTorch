@@ -145,6 +145,15 @@ public: // data_ needs friend access from static methods
             InstanceMethod("conv_transpose2d", &TensorWrap::ConvTranspose2d_),
             InstanceMethod("avg_pool2d", &TensorWrap::AvgPool2d),
             
+            // Backward ops
+            InstanceMethod("scatter_add", &TensorWrap::ScatterAdd),
+            InstanceMethod("interp1d_backward", &TensorWrap::Interp1dBackward),
+            InstanceMethod("avgpool2d_backward", &TensorWrap::AvgPool2dBackward),
+            StaticMethod("conv1dBackwardWeight", &TensorWrap::Conv1dBackwardWeight),
+            StaticMethod("conv2dBackwardWeight", &TensorWrap::Conv2dBackwardWeight),
+            StaticMethod("convTranspose1dBackwardWeight", &TensorWrap::ConvTranspose1dBackwardWeight),
+            StaticMethod("convTranspose2dBackwardWeight", &TensorWrap::ConvTranspose2dBackwardWeight),
+            
             // Static methods
             StaticMethod("cat", &TensorWrap::Cat),
             StaticMethod("where", &TensorWrap::Where),
@@ -456,6 +465,88 @@ public: // data_ needs friend access from static methods
         int mode = info.Length() > 1 ? info[1].As<Napi::Number>().Int32Value() : 0;
         bool align = info.Length() > 2 ? info[2].As<Napi::Boolean>().Value() : false;
         return Wrap(info.Env(), tensor_.interpolate(target, mode, align));
+    }
+
+    // ==================== Backward ops ====================
+    Napi::Value ScatterAdd(const Napi::CallbackInfo& info) {
+        auto* grad = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        auto* indices = Napi::ObjectWrap<TensorWrap>::Unwrap(info[1].As<Napi::Object>());
+        int vocab_size = info[2].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), tensor_.scatter_add(grad->tensor(), indices->tensor(), vocab_size));
+    }
+    Napi::Value Interp1dBackward(const Napi::CallbackInfo& info) {
+        int in_len = info[0].As<Napi::Number>().Int32Value();
+        int mode = info[1].As<Napi::Number>().Int32Value();
+        bool align = info.Length() > 2 ? info[2].As<Napi::Boolean>().Value() : false;
+        return Wrap(info.Env(), tensor_.interp1d_backward(in_len, mode, align));
+    }
+    Napi::Value AvgPool2dBackward(const Napi::CallbackInfo& info) {
+        int H = info[0].As<Napi::Number>().Int32Value();
+        int W = info[1].As<Napi::Number>().Int32Value();
+        int kH = info[2].As<Napi::Number>().Int32Value();
+        int kW = info[3].As<Napi::Number>().Int32Value();
+        int sH = info[4].As<Napi::Number>().Int32Value();
+        int sW = info[5].As<Napi::Number>().Int32Value();
+        int pH = info[6].As<Napi::Number>().Int32Value();
+        int pW = info[7].As<Napi::Number>().Int32Value();
+        bool cip = info.Length() > 8 ? info[8].As<Napi::Boolean>().Value() : true;
+        return Wrap(info.Env(), tensor_.avgpool2d_backward(H, W, kH, kW, sH, sW, pH, pW, cip));
+    }
+    static Napi::Value Conv1dBackwardWeight(const Napi::CallbackInfo& info) {
+        auto* input = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        auto* grad_out = Napi::ObjectWrap<TensorWrap>::Unwrap(info[1].As<Napi::Object>());
+        int C_in_g = info[2].As<Napi::Number>().Int32Value();
+        int K = info[3].As<Napi::Number>().Int32Value();
+        int stride = info[4].As<Napi::Number>().Int32Value();
+        int padding = info[5].As<Napi::Number>().Int32Value();
+        int dilation = info[6].As<Napi::Number>().Int32Value();
+        int groups = info[7].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), Tensor::conv1d_backward_weight(
+            input->tensor(), grad_out->tensor(), C_in_g, K, stride, padding, dilation, groups));
+    }
+    static Napi::Value ConvTranspose1dBackwardWeight(const Napi::CallbackInfo& info) {
+        auto* input = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        auto* grad_out = Napi::ObjectWrap<TensorWrap>::Unwrap(info[1].As<Napi::Object>());
+        int C_out_g = info[2].As<Napi::Number>().Int32Value();
+        int K = info[3].As<Napi::Number>().Int32Value();
+        int stride = info[4].As<Napi::Number>().Int32Value();
+        int padding = info[5].As<Napi::Number>().Int32Value();
+        int dilation = info[6].As<Napi::Number>().Int32Value();
+        int groups = info[7].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), Tensor::conv_transpose1d_backward_weight(
+            input->tensor(), grad_out->tensor(), C_out_g, K, stride, padding, dilation, groups));
+    }
+    static Napi::Value ConvTranspose2dBackwardWeight(const Napi::CallbackInfo& info) {
+        auto* input = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        auto* grad_out = Napi::ObjectWrap<TensorWrap>::Unwrap(info[1].As<Napi::Object>());
+        int Co_g = info[2].As<Napi::Number>().Int32Value();
+        int kH = info[3].As<Napi::Number>().Int32Value();
+        int kW = info[4].As<Napi::Number>().Int32Value();
+        int sH = info[5].As<Napi::Number>().Int32Value();
+        int sW = info[6].As<Napi::Number>().Int32Value();
+        int pH = info[7].As<Napi::Number>().Int32Value();
+        int pW = info[8].As<Napi::Number>().Int32Value();
+        int dH = info[9].As<Napi::Number>().Int32Value();
+        int dW = info[10].As<Napi::Number>().Int32Value();
+        int groups = info[11].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), Tensor::conv_transpose2d_backward_weight(
+            input->tensor(), grad_out->tensor(), Co_g, kH, kW, sH, sW, pH, pW, dH, dW, groups));
+    }
+    static Napi::Value Conv2dBackwardWeight(const Napi::CallbackInfo& info) {
+        auto* input = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        auto* grad_out = Napi::ObjectWrap<TensorWrap>::Unwrap(info[1].As<Napi::Object>());
+        int Ci_g = info[2].As<Napi::Number>().Int32Value();
+        int kH = info[3].As<Napi::Number>().Int32Value();
+        int kW = info[4].As<Napi::Number>().Int32Value();
+        int sH = info[5].As<Napi::Number>().Int32Value();
+        int sW = info[6].As<Napi::Number>().Int32Value();
+        int pH = info[7].As<Napi::Number>().Int32Value();
+        int pW = info[8].As<Napi::Number>().Int32Value();
+        int dH = info[9].As<Napi::Number>().Int32Value();
+        int dW = info[10].As<Napi::Number>().Int32Value();
+        int groups = info[11].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), Tensor::conv2d_backward_weight(
+            input->tensor(), grad_out->tensor(), Ci_g, kH, kW, sH, sW, pH, pW, dH, dW, groups));
     }
 
     // ==================== Static methods ====================

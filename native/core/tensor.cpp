@@ -80,6 +80,19 @@ extern "C" {
         int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, cudaStream_t);
     void launch_avgpool2d(const float*, float*,
         int, int, int, int, int, int, int, int, int, int, int, int, bool, cudaStream_t);
+    // Backward kernels
+    void launch_scatter_add(const float*, const int*, float*, int, int, int, cudaStream_t);
+    void launch_interp1d_backward(const float*, float*, int, int, int, int, bool, cudaStream_t);
+    void launch_avgpool2d_backward(const float*, float*,
+        int, int, int, int, int, int, int, int, int, int, int, int, bool, cudaStream_t);
+    void launch_conv1d_backward_weight(const float*, const float*, float*, float*,
+        int, int, int, int, int, int, int, int, int, int, cudaStream_t);
+    void launch_conv2d_backward_weight(const float*, const float*, float*, float*,
+        int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, cudaStream_t);
+    void launch_conv_transpose1d_backward_weight(const float*, const float*, float*, float*,
+        int, int, int, int, int, int, int, int, int, int, cudaStream_t);
+    void launch_conv_transpose2d_backward_weight(const float*, const float*, float*, float*,
+        int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, cudaStream_t);
 }
 
 // ==================== Helpers ====================
@@ -380,19 +393,18 @@ Tensor Tensor::argmax(int dim) const {
     dim = normalize_axis(dim, ndim());
     int outer, inner; Shape os;
     compute_reduce_params(shape_, dim, ndim(), false, outer, inner, os);
-    Tensor dummy(os, dtype_); // values (unused)
-    Tensor r(os, dtype_); // indices stored as float -> int tensor
+    Tensor dummy(os, dtype_);
     int total = outer * inner;
     int* d_indices; cudaMalloc(&d_indices, total * sizeof(int));
     launch_reduce_max(c.data<float>(), dummy.data<float>(), d_indices, outer, shape_[dim], inner, 0);
     cudaDeviceSynchronize();
-    // Create int tensor
-    Tensor result(os, DType::Float32);
-    void* ptr; cudaMalloc(&ptr, total * sizeof(int));
-    cudaMemcpy(ptr, d_indices, total * sizeof(int), cudaMemcpyDeviceToDevice);
+    // Convert int indices to float
+    std::vector<int> h_idx(total);
+    cudaMemcpy(h_idx.data(), d_indices, total * sizeof(int), cudaMemcpyDeviceToHost);
     cudaFree(d_indices);
-    result.data_ = std::shared_ptr<void>(ptr, [](void* p) { cudaFree(p); });
-    return result;
+    std::vector<float> h_float(total);
+    for (int i = 0; i < total; i++) h_float[i] = (float)h_idx[i];
+    return from_array(h_float.data(), os);
 }
 
 Tensor Tensor::argmin(int dim) const {
@@ -405,12 +417,12 @@ Tensor Tensor::argmin(int dim) const {
     int* d_indices; cudaMalloc(&d_indices, total * sizeof(int));
     launch_reduce_min(c.data<float>(), dummy.data<float>(), d_indices, outer, shape_[dim], inner, 0);
     cudaDeviceSynchronize();
-    Tensor result(os, DType::Float32);
-    void* ptr; cudaMalloc(&ptr, total * sizeof(int));
-    cudaMemcpy(ptr, d_indices, total * sizeof(int), cudaMemcpyDeviceToDevice);
+    std::vector<int> h_idx(total);
+    cudaMemcpy(h_idx.data(), d_indices, total * sizeof(int), cudaMemcpyDeviceToHost);
     cudaFree(d_indices);
-    result.data_ = std::shared_ptr<void>(ptr, [](void* p) { cudaFree(p); });
-    return result;
+    std::vector<float> h_float(total);
+    for (int i = 0; i < total; i++) h_float[i] = (float)h_idx[i];
+    return from_array(h_float.data(), os);
 }
 
 // ==================== flatten ====================
@@ -741,6 +753,111 @@ std::vector<float> Tensor::to_array() const {
         result[i] = raw[offset];
     }
     return result;
+}
+
+// ==================== Backward ops ====================
+
+// Embedding backward: scatter_add grad into weight_grad
+Tensor Tensor::scatter_add(const Tensor& grad, const Tensor& indices, int vocab_size) const {
+    // grad: [num_indices, embed_dim], indices: [num_indices]
+    int embed_dim = grad.shape()[grad.ndim() - 1];
+    int num_indices = indices.size();
+    Tensor r({vocab_size, embed_dim}, grad.dtype());
+    launch_scatter_add(grad.data<float>(), indices.data<int>(), r.data<float>(),
+        num_indices, embed_dim, vocab_size, 0);
+    cudaDeviceSynchronize();
+    return r;
+}
+
+// Interpolate 1D backward
+Tensor Tensor::interp1d_backward(int in_len, int mode, bool align_corners) const {
+    // this = grad_output: [B, C, out_len]
+    Tensor c = contiguous();
+    int bc = 1;
+    for (int i = 0; i < ndim() - 1; i++) bc *= shape_[i];
+    int out_len = shape_[ndim() - 1];
+    Shape os = shape_; os[ndim() - 1] = in_len;
+    Tensor r(os, dtype_);
+    launch_interp1d_backward(c.data<float>(), r.data<float>(), bc, in_len, out_len, mode, align_corners, 0);
+    cudaDeviceSynchronize();
+    return r;
+}
+
+// AvgPool2d backward
+Tensor Tensor::avgpool2d_backward(int H, int W, int kH, int kW, int sH, int sW, int pH, int pW, bool cip) const {
+    // this = grad_output: [B, C, Ho, Wo]
+    Tensor c = contiguous();
+    int B = shape_[0], C = shape_[1], Ho = shape_[2], Wo = shape_[3];
+    Tensor r({B, C, H, W}, dtype_);
+    launch_avgpool2d_backward(c.data<float>(), r.data<float>(),
+        B, C, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo, cip, 0);
+    cudaDeviceSynchronize();
+    return r;
+}
+
+// Conv1d backward weight
+Tensor Tensor::conv1d_backward_weight(const Tensor& input, const Tensor& grad_output,
+    int C_in_g, int K, int stride, int padding, int dilation, int groups) {
+    Tensor ci = input.contiguous(), cg = grad_output.contiguous();
+    int B = input.shape()[0], C_in = input.shape()[1], L_in = input.shape()[2];
+    int C_out = grad_output.shape()[1], L_out = grad_output.shape()[2];
+    Tensor gw({C_out, C_in_g, K}, input.dtype());
+    int col_size = B * C_in * K * L_out;
+    float* col_buf; cudaMalloc(&col_buf, col_size * sizeof(float));
+    launch_conv1d_backward_weight(ci.data<float>(), cg.data<float>(), gw.data<float>(), col_buf,
+        B, C_in, L_in, C_out, K, stride, padding, dilation, groups, L_out, 0);
+    cudaDeviceSynchronize();
+    cudaFree(col_buf);
+    return gw;
+}
+
+// Conv2d backward weight
+Tensor Tensor::conv2d_backward_weight(const Tensor& input, const Tensor& grad_output,
+    int Ci_g, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int groups) {
+    Tensor ci = input.contiguous(), cg = grad_output.contiguous();
+    int B = input.shape()[0], Ci = input.shape()[1], H = input.shape()[2], W = input.shape()[3];
+    int Co = grad_output.shape()[1], Ho = grad_output.shape()[2], Wo = grad_output.shape()[3];
+    Tensor gw({Co, Ci_g, kH, kW}, input.dtype());
+    int col_size = B * Ci * kH * kW * Ho * Wo;
+    float* col_buf; cudaMalloc(&col_buf, col_size * sizeof(float));
+    launch_conv2d_backward_weight(ci.data<float>(), cg.data<float>(), gw.data<float>(), col_buf,
+        B, Ci, H, W, Co, kH, kW, sH, sW, pH, pW, dH, dW, groups, Ho, Wo, 0);
+    cudaDeviceSynchronize();
+    cudaFree(col_buf);
+    return gw;
+}
+
+// ConvTranspose1d backward weight
+Tensor Tensor::conv_transpose1d_backward_weight(const Tensor& input, const Tensor& grad_output,
+    int C_out_g, int K, int stride, int padding, int dilation, int groups) {
+    Tensor ci = input.contiguous(), cg = grad_output.contiguous();
+    int B = input.shape()[0], C_in = input.shape()[1], L_in = input.shape()[2];
+    int C_out = grad_output.shape()[1], L_out = grad_output.shape()[2];
+    // weight shape: [C_in, C_out/groups, K]
+    Tensor gw({C_in, C_out_g, K}, input.dtype());
+    int col_size = B * C_out * K * L_in;
+    float* col_buf; cudaMalloc(&col_buf, col_size * sizeof(float));
+    launch_conv_transpose1d_backward_weight(ci.data<float>(), cg.data<float>(), gw.data<float>(), col_buf,
+        B, C_in, L_in, C_out, K, stride, padding, dilation, groups, L_out, 0);
+    cudaDeviceSynchronize();
+    cudaFree(col_buf);
+    return gw;
+}
+
+// ConvTranspose2d backward weight
+Tensor Tensor::conv_transpose2d_backward_weight(const Tensor& input, const Tensor& grad_output,
+    int Co_g, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int groups) {
+    Tensor ci = input.contiguous(), cg = grad_output.contiguous();
+    int B = input.shape()[0], Ci = input.shape()[1], Hi = input.shape()[2], Wi = input.shape()[3];
+    int Co = grad_output.shape()[1], Ho = grad_output.shape()[2], Wo = grad_output.shape()[3];
+    Tensor gw({Ci, Co_g, kH, kW}, input.dtype());
+    int col_size = B * Co * kH * kW * Hi * Wi;
+    float* col_buf; cudaMalloc(&col_buf, col_size * sizeof(float));
+    launch_conv_transpose2d_backward_weight(ci.data<float>(), cg.data<float>(), gw.data<float>(), col_buf,
+        B, Ci, Hi, Wi, Co, kH, kW, sH, sW, pH, pW, dH, dW, groups, Ho, Wo, 0);
+    cudaDeviceSynchronize();
+    cudaFree(col_buf);
+    return gw;
 }
 
 // Complex — not implemented for RVC

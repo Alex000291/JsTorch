@@ -37,7 +37,13 @@ struct MulOp { __device__ float operator()(float a, float b) const { return a * 
 struct DivOp { __device__ float operator()(float a, float b) const { return a / b; } };
 struct MaxOp { __device__ float operator()(float a, float b) const { return fmaxf(a, b); } };
 struct MinOp { __device__ float operator()(float a, float b) const { return fminf(a, b); } };
-struct PowOp { __device__ float operator()(float a, float b) const { return powf(a, b); } };
+struct PowOp { __device__ float operator()(float a, float b) const {
+    if (a >= 0.0f) return powf(a, b);
+    float r = powf(-a, b);
+    int ib = (int)b;
+    if ((float)ib == b) return (ib % 2 != 0) ? -r : r;
+    return __int_as_float(0x7FC00000);
+} };
 struct GtOp  { __device__ float operator()(float a, float b) const { return a > b ? 1.0f : 0.0f; } };
 struct LtOp  { __device__ float operator()(float a, float b) const { return a < b ? 1.0f : 0.0f; } };
 struct GeOp  { __device__ float operator()(float a, float b) const { return a >= b ? 1.0f : 0.0f; } };
