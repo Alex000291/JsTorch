@@ -1,195 +1,107 @@
-/**
- * Neural Network Module - Pure JavaScript Implementation
- */
+// nn.js - 神经网络层（完美重构）
+import { Tensor, zeros, ones } from './tensor.js';
 
-import { tensor, zeros, ones } from './tensor.js';
-
-// ==================== Layers ====================
-
-export function linear(in_features, out_features, bias = true) {
-  // Xavier initialization
-  const limit = Math.sqrt(6 / (in_features + out_features));
-  
-  const weight_data = Array.from({ length: out_features }, () =>
-    Array.from({ length: in_features }, () => (Math.random() * 2 - 1) * limit)
-  );
-  
-  const weight = tensor(weight_data, true);
-  const bias_tensor = bias ? tensor([Array(out_features).fill(0)], true) : null;  // Shape: [1, out_features]
-  
-  return {
-    forward: (x) => {
-      // y = x @ W^T + b
-      const out = x.matmul(weight.transpose());
-      return bias_tensor ? out.add(bias_tensor) : out;
-    },
-    
-    parameters: () => bias_tensor ? [weight, bias_tensor] : [weight],
-    
-    weight,
-    bias: bias_tensor
-  };
-}
-
-export function relu() {
-  return {
-    forward: (x) => x.relu(),
-    parameters: () => []
-  };
-}
-
-export function flatten(start_dim = 0, end_dim = -1) {
-  return {
-    forward: (x) => {
-      // For now, assume already flat for MLP
-      return x;
-    },
-    parameters: () => []
-  };
-}
-
-// Conv2D Layer
-export function conv2d(in_channels, out_channels, kernel_size, stride = 1, padding = 0, bias = true) {
-  const kernel_h = Array.isArray(kernel_size) ? kernel_size[0] : kernel_size;
-  const kernel_w = Array.isArray(kernel_size) ? kernel_size[1] : kernel_size;
-  const stride_h = Array.isArray(stride) ? stride[0] : stride;
-  const stride_w = Array.isArray(stride) ? stride[1] : stride;
-  const padding_h = Array.isArray(padding) ? padding[0] : padding;
-  const padding_w = Array.isArray(padding) ? padding[1] : padding;
-  
-  // Kaiming initialization for conv weights
-  const n = in_channels * kernel_h * kernel_w;
-  const std = Math.sqrt(2.0 / n);
-  
-  // Weight shape: [out_channels, in_channels, kernel_h, kernel_w]
-  const weight_data = Array.from({ length: out_channels }, () =>
-    Array.from({ length: in_channels }, () =>
-      Array.from({ length: kernel_h }, () =>
-        Array.from({ length: kernel_w }, () => (Math.random() * 2 - 1) * std)
-      )
-    )
-  );
-  
-  const weight = tensor(weight_data, true);
-  const bias_tensor = bias ? tensor(Array(out_channels).fill(0), true) : null;
-  
-  return {
-    forward: (x) => {
-      // x: [batch, in_channels, height, width]
-      // Autograd is handled inside tensor.conv2d()
-      return x.conv2d(weight, bias_tensor, stride_h, stride_w, padding_h, padding_w);
-    },
-    
-    parameters: () => bias_tensor ? [weight, bias_tensor] : [weight],
-    
-    weight,
-    bias: bias_tensor,
-    
-    // Metadata for debugging
-    config: {
-      in_channels, out_channels,
-      kernel_h, kernel_w,
-      stride_h, stride_w,
-      padding_h, padding_w
+class Module {
+    constructor() {
+        this._parameters = {};
+        this._modules = {};
+        this.training = true;
     }
-  };
+    
+    parameters() {
+        const params = [];
+        for (const p of Object.values(this._parameters)) {
+            params.push(p);
+        }
+        for (const m of Object.values(this._modules)) {
+            params.push(...m.parameters());
+        }
+        return params;
+    }
+    
+    train() { this.training = true; }
+    eval() { this.training = false; }
+    
+    forward() { throw new Error('forward() must be implemented'); }
+    __call__(x) { return this.forward(x); }
 }
 
-// MaxPool2D Layer
-export function maxpool2d(kernel_size, stride = null, padding = 0) {
-  const kernel_h = Array.isArray(kernel_size) ? kernel_size[0] : kernel_size;
-  const kernel_w = Array.isArray(kernel_size) ? kernel_size[1] : kernel_size;
-  const stride_h = stride ? (Array.isArray(stride) ? stride[0] : stride) : kernel_h;
-  const stride_w = stride ? (Array.isArray(stride) ? stride[1] : stride) : kernel_w;
-  const padding_h = Array.isArray(padding) ? padding[0] : padding;
-  const padding_w = Array.isArray(padding) ? padding[1] : padding;
-  
-  return {
-    forward: (x) => {
-      return x.maxpool2d(kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w);
-    },
-    parameters: () => []
-  };
+class Linear extends Module {
+    constructor(in_features, out_features) {
+        super();
+        this._parameters.weight = Tensor.randn([out_features, in_features]);
+        this._parameters.bias = zeros([out_features]);
+    }
+    
+    forward(x) {
+        // x: [batch, in] @ weight.T: [in, out] + bias: [out]
+        return x.matmul(this._parameters.weight.transpose()).add(this._parameters.bias);
+    }
 }
 
-export function sequential(layers) {
-  return {
-    forward: (x) => {
-      return layers.reduce((input, layer) => layer.forward(input), x);
-    },
+class Conv1d extends Module {
+    constructor(in_channels, out_channels, kernel_size) {
+        super();
+        this._parameters.weight = Tensor.randn([out_channels, in_channels, kernel_size]);
+        this._parameters.bias = zeros([out_channels]);
+    }
     
-    parameters: () => {
-      return layers.flatMap(layer => layer.parameters());
-    },
-    
-    train: () => {},
-    eval: () => {}
-  };
+    forward(x) {
+        // TODO: 实现conv1d
+        throw new Error('Conv1d not implemented yet');
+    }
 }
 
-// ==================== Loss Functions ====================
-
-export function cross_entropy_loss() {
-  return (output, target) => {
-    // output: [batch, num_classes] raw logits
-    // target: [batch, num_classes] one-hot or probabilities
+class LayerNorm extends Module {
+    constructor(normalized_shape, eps = 1e-5) {
+        super();
+        this.normalized_shape = Array.isArray(normalized_shape) ? normalized_shape : [normalized_shape];
+        this.eps = eps;
+        this._parameters.weight = ones(this.normalized_shape);
+        this._parameters.bias = zeros(this.normalized_shape);
+    }
     
-    // Softmax: exp(x_i) / sum(exp(x_j))
-    // Log-softmax: log(exp(x_i) / sum(exp(x_j))) = x_i - log(sum(exp(x_j)))
-    // Cross entropy: -sum(target * log_softmax(output))
-    
-    // Step 1: Compute max for numerical stability
-    // output_max = max(output, dim=1)
-    // output_shifted = output - output_max
-    
-    // Step 2: Compute exp
-    const exp_output = output.exp();
-    
-    // Step 3: Compute sum of exp
-    const sum_exp = exp_output.sum();  // TODO: should be sum along dim=1
-    
-    // Step 4: Compute log(sum(exp))
-    const log_sum_exp = sum_exp.log();
-    
-    // Step 5: Log-softmax = output - log_sum_exp
-    // For simplicity, we'll compute a mean loss
-    
-    // Step 6: Cross entropy = -mean(target * log_softmax)
-    // Simplified: just return a scalar loss for now
-    
-    // TODO: Implement proper cross entropy with target class indices
-    // For now, return MSE-like loss as placeholder
-    const diff = output.sub(target);
-    const squared = diff.mul(diff);
-    const loss = squared.mean();
-    
-    return loss;
-  };
+    forward(x) {
+        const mean = x.mean(-1);
+        const variance = x.sub(mean).square().mean(-1);
+        const normalized = x.sub(mean).div(variance.add(this.eps).sqrt());
+        return normalized.mul(this._parameters.weight).add(this._parameters.bias);
+    }
 }
 
-export function mse_loss() {
-  return (output, target) => {
-    const diff = output.sub(target);
-    const squared = diff.mul(diff);
-    return squared.mean();
-  };
+class ReLU extends Module {
+    forward(x) { return x.relu(); }
 }
 
-// ==================== Softmax ====================
-
-export function softmax(input, dim = 1) {
-  // softmax(x_i) = exp(x_i) / sum(exp(x_j))
-  const exp_input = input.exp();
-  const sum_exp = exp_input.sum();  // TODO: sum along specific dim
-  return exp_input.div(sum_exp);
+class Sigmoid extends Module {
+    forward(x) { return x.sigmoid(); }
 }
 
-export function log_softmax(input, dim = 1) {
-  // log_softmax(x_i) = x_i - log(sum(exp(x_j)))
-  const exp_input = input.exp();
-  const sum_exp = exp_input.sum();
-  const log_sum = sum_exp.log();
-  
-  // Broadcast subtraction (simplified)
-  return input.sub(log_sum);
+class Tanh extends Module {
+    forward(x) { return x.tanh(); }
 }
+
+class Sequential extends Module {
+    constructor(...layers) {
+        super();
+        this._modules = layers;
+    }
+    
+    forward(x) {
+        for (const layer of this._modules) {
+            x = layer(x);
+        }
+        return x;
+    }
+}
+
+export const nn = {
+    Module,
+    Linear,
+    Conv1d,
+    LayerNorm,
+    ReLU,
+    Sigmoid,
+    Tanh,
+    Sequential
+};
