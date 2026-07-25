@@ -488,6 +488,9 @@ B.interpolate = (g, s) => {
 B.avg_pool2d = (g, s) => {
     return [g.avgpool2d_backward(s.H, s.W, s.kH, s.kW, s.sH, s.sW, s.pH, s.pW, s.cip)];
 };
+B.max_pool2d = (g, s) => {
+    return [native.Tensor.maxpool2dBackward(g, s.indices, s.B, s.C, s.H, s.W)];
+};
 
 // ==================== Generate op methods via metaprogramming ====================
 
@@ -731,6 +734,13 @@ GradTensor.prototype.avg_pool2d = function (kH, kW, sH, sW, pH, pW, cip = true) 
     const H = this.shape[2], W = this.shape[3];
     const saved = { H, W, kH, kW, sH, sW, pH, pW, cip };
     return new GradTensor(out_data, true, (g) => B.avg_pool2d(g, saved), [this], saved);
+};
+GradTensor.prototype.max_pool2d = function (kH, kW, sH, sW, pH, pW) {
+    const [out_data, indices] = this.data.max_pool2d(kH, kW, sH, sW, pH, pW);
+    if (!needsGrad(this)) return new GradTensor(out_data, false);
+    const batchN = this.shape[0], ch = this.shape[1], inH = this.shape[2], inW = this.shape[3];
+    const saved = { indices, B: batchN, C: ch, H: inH, W: inW };
+    return new GradTensor(out_data, true, (g) => B.max_pool2d(g, saved), [this], saved);
 };
 GradTensor.prototype.interpolate = function (target_size, mode = 0, align_corners = false) {
     const orig_size = this.shape[this.shape.length - 1];

@@ -173,6 +173,42 @@ __global__ void avgpool2d_kernel(const float* input, float* output,
     output[idx] = sum / denom;
 }
 
+// === MaxPool2d ===
+
+__global__ void maxpool2d_kernel(const float* input, float* output, int* indices,
+    int B, int C, int H, int W, int kH, int kW, int sH, int sW,
+    int pH, int pW, int Ho, int Wo) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * C * Ho * Wo;
+    if (idx >= total) return;
+    int b = idx / (C*Ho*Wo);
+    int r = idx % (C*Ho*Wo);
+    int c = r / (Ho*Wo); r %= Ho*Wo;
+    int ho = r / Wo, wo = r % Wo;
+    float best = -1e38f;
+    int best_idx = 0;
+    for (int kh = 0; kh < kH; kh++) {
+        for (int kw = 0; kw < kW; kw++) {
+            int hi = ho*sH - pH + kh;
+            int wi = wo*sW - pW + kw;
+            if (hi >= 0 && hi < H && wi >= 0 && wi < W) {
+                int in_idx = ((b*C+c)*H+hi)*W+wi;
+                float v = input[in_idx];
+                if (v > best) { best = v; best_idx = in_idx; }
+            }
+        }
+    }
+    output[idx] = best;
+    indices[idx] = best_idx;
+}
+
+__global__ void maxpool2d_backward_kernel(const float* grad_output, const int* indices,
+    float* grad_input, int out_total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= out_total) return;
+    atomicAdd(&grad_input[indices[idx]], grad_output[idx]);
+}
+
 extern "C" {
 
 // Conv1d: input [B, C_in, L_in], weight [C_out, C_in/groups, K] -> [B, C_out, L_out]
@@ -327,6 +363,21 @@ void launch_avgpool2d(const float* input, float* output,
     int total = B * C * Ho * Wo;
     avgpool2d_kernel<<<(total+255)/256, 256, 0, s>>>(
         input, output, B, C, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo, count_include_pad);
+}
+
+void launch_maxpool2d(const float* input, float* output, int* indices,
+    int B, int C, int H, int W, int kH, int kW, int sH, int sW,
+    int pH, int pW, int Ho, int Wo, cudaStream_t s) {
+    int total = B * C * Ho * Wo;
+    maxpool2d_kernel<<<(total+255)/256, 256, 0, s>>>(
+        input, output, indices, B, C, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo);
+}
+
+void launch_maxpool2d_backward(const float* grad_output, const int* indices,
+    float* grad_input, int input_total, int out_total, cudaStream_t s) {
+    cudaMemsetAsync(grad_input, 0, input_total * sizeof(float), s);
+    maxpool2d_backward_kernel<<<(out_total+255)/256, 256, 0, s>>>(
+        grad_output, indices, grad_input, out_total);
 }
 
 // Conv1d backward weight: im2col(input) then gemm with grad_output

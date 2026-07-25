@@ -307,6 +307,22 @@ class AvgPool2d extends Module {
     }
 }
 
+class MaxPool2d extends Module {
+    constructor(kernel_size, stride, padding = 0) {
+        super();
+        this.kH = Array.isArray(kernel_size) ? kernel_size[0] : kernel_size;
+        this.kW = Array.isArray(kernel_size) ? kernel_size[1] : kernel_size;
+        if (stride === undefined) stride = kernel_size;
+        this.sH = Array.isArray(stride) ? stride[0] : stride;
+        this.sW = Array.isArray(stride) ? stride[1] : stride;
+        this.pH = Array.isArray(padding) ? padding[0] : padding;
+        this.pW = Array.isArray(padding) ? padding[1] : padding;
+    }
+    forward(x) {
+        return x.max_pool2d(this.kH, this.kW, this.sH, this.sW, this.pH, this.pW);
+    }
+}
+
 // ==================== Upsample ====================
 class Upsample extends Module {
     constructor({ scale_factor, size, mode = 'nearest' } = {}) {
@@ -529,7 +545,7 @@ const F = {
 export const nn = {
     Module, Linear, Embedding,
     Conv1d, ConvTranspose1d, Conv2d, ConvTranspose2d,
-    AvgPool2d, Upsample, GRU,
+    AvgPool2d, MaxPool2d, Upsample, GRU,
     LayerNorm, GroupNorm, BatchNorm1d, BatchNorm2d,
     ReLU, LeakyReLU, Sigmoid, Tanh, GELU, SiLU, Dropout,
     Sequential, ModuleList,

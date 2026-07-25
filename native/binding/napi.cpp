@@ -151,11 +151,13 @@ public: // data_ needs friend access from static methods
             InstanceMethod("conv2d", &TensorWrap::Conv2d_),
             InstanceMethod("conv_transpose2d", &TensorWrap::ConvTranspose2d_),
             InstanceMethod("avg_pool2d", &TensorWrap::AvgPool2d),
+            InstanceMethod("max_pool2d", &TensorWrap::MaxPool2d),
             
             // Backward ops
             InstanceMethod("scatter_add", &TensorWrap::ScatterAdd),
             InstanceMethod("interp1d_backward", &TensorWrap::Interp1dBackward),
             InstanceMethod("avgpool2d_backward", &TensorWrap::AvgPool2dBackward),
+            StaticMethod("maxpool2dBackward", &TensorWrap::MaxPool2dBackward),
             StaticMethod("conv1dBackwardWeight", &TensorWrap::Conv1dBackwardWeight),
             StaticMethod("conv2dBackwardWeight", &TensorWrap::Conv2dBackwardWeight),
             StaticMethod("convTranspose1dBackwardWeight", &TensorWrap::ConvTranspose1dBackwardWeight),
@@ -471,6 +473,21 @@ public: // data_ needs friend access from static methods
         return Wrap(info.Env(), tensor_.avg_pool2d(kH, kW, sH, sW, pH, pW, cip));
     }
     
+    Napi::Value MaxPool2d(const Napi::CallbackInfo& info) {
+        int kH = info[0].As<Napi::Number>().Int32Value();
+        int kW = info[1].As<Napi::Number>().Int32Value();
+        int sH = info[2].As<Napi::Number>().Int32Value();
+        int sW = info[3].As<Napi::Number>().Int32Value();
+        int pH = info[4].As<Napi::Number>().Int32Value();
+        int pW = info[5].As<Napi::Number>().Int32Value();
+        auto [out, indices] = tensor_.max_pool2d(kH, kW, sH, sW, pH, pW);
+        Napi::Env env = info.Env();
+        Napi::Array result = Napi::Array::New(env, 2);
+        result[(uint32_t)0] = Wrap(env, std::move(out));
+        result[1u] = Wrap(env, std::move(indices));
+        return result;
+    }
+
     Napi::Value Interpolate(const Napi::CallbackInfo& info) {
         int target = info[0].As<Napi::Number>().Int32Value();
         int mode = info.Length() > 1 ? info[1].As<Napi::Number>().Int32Value() : 0;
@@ -503,6 +520,16 @@ public: // data_ needs friend access from static methods
         bool cip = info.Length() > 8 ? info[8].As<Napi::Boolean>().Value() : true;
         return Wrap(info.Env(), tensor_.avgpool2d_backward(H, W, kH, kW, sH, sW, pH, pW, cip));
     }
+    static Napi::Value MaxPool2dBackward(const Napi::CallbackInfo& info) {
+        auto* grad = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        auto* indices = Napi::ObjectWrap<TensorWrap>::Unwrap(info[1].As<Napi::Object>());
+        int B = info[2].As<Napi::Number>().Int32Value();
+        int C = info[3].As<Napi::Number>().Int32Value();
+        int H = info[4].As<Napi::Number>().Int32Value();
+        int W = info[5].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), Tensor::maxpool2d_backward(grad->tensor_, indices->tensor_, B, C, H, W));
+    }
+
     static Napi::Value Conv1dBackwardWeight(const Napi::CallbackInfo& info) {
         auto* input = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
         auto* grad_out = Napi::ObjectWrap<TensorWrap>::Unwrap(info[1].As<Napi::Object>());
@@ -716,6 +743,7 @@ public:
             // Conv/Pool
             InstanceMethod("conv2d", &GradTensorWrap::Conv2d),
             InstanceMethod("avg_pool2d", &GradTensorWrap::AvgPool2d),
+            InstanceMethod("max_pool2d", &GradTensorWrap::MaxPool2d),
 
             // Static
             StaticMethod("randn", &GradTensorWrap::Randn),
@@ -967,6 +995,16 @@ public:
         int pW = info[5].As<Napi::Number>().Int32Value();
         bool cip = info.Length() > 6 ? info[6].As<Napi::Boolean>().Value() : true;
         return Wrap(info.Env(), gt_->avg_pool2d_(kH, kW, sH, sW, pH, pW, cip));
+    }
+
+    Napi::Value MaxPool2d(const Napi::CallbackInfo& info) {
+        int kH = info[0].As<Napi::Number>().Int32Value();
+        int kW = info[1].As<Napi::Number>().Int32Value();
+        int sH = info[2].As<Napi::Number>().Int32Value();
+        int sW = info[3].As<Napi::Number>().Int32Value();
+        int pH = info[4].As<Napi::Number>().Int32Value();
+        int pW = info[5].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), gt_->max_pool2d_(kH, kW, sH, sW, pH, pW));
     }
 
     // ==================== Static factories ====================

@@ -84,6 +84,9 @@ extern "C" {
     // Backward kernels
     void launch_scatter_add(const float*, const int*, float*, int, int, int, cudaStream_t);
     void launch_interp1d_backward(const float*, float*, int, int, int, int, bool, cudaStream_t);
+    void launch_maxpool2d(const float*, float*, int*,
+        int, int, int, int, int, int, int, int, int, int, int, int, cudaStream_t);
+    void launch_maxpool2d_backward(const float*, const int*, float*, int, int, cudaStream_t);
     void launch_avgpool2d_backward(const float*, float*,
         int, int, int, int, int, int, int, int, int, int, int, int, bool, cudaStream_t);
     void launch_conv1d_backward_weight(const float*, const float*, float*, float*,
@@ -487,6 +490,29 @@ Tensor Tensor::avg_pool2d(int kH, int kW, int sH, int sW, int pH, int pW, bool c
     Tensor r({B, C, Ho, Wo}, dtype_);
     launch_avgpool2d(c.data<float>(), r.data<float>(), B, C, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo, count_include_pad, 0);
     return r;
+}
+
+// ==================== MaxPool2d ====================
+std::pair<Tensor, Tensor> Tensor::max_pool2d(int kH, int kW, int sH, int sW, int pH, int pW) const {
+    Tensor c = contiguous();
+    int B = shape_[0], C = shape_[1], H = shape_[2], W = shape_[3];
+    int Ho = (H + 2*pH - kH) / sH + 1;
+    int Wo = (W + 2*pW - kW) / sW + 1;
+    Tensor out({B, C, Ho, Wo}, dtype_);
+    // Indices stored as int (DType::Float32 storage, reinterpreted)
+    Tensor idx({B, C, Ho, Wo}, dtype_);
+    launch_maxpool2d(c.data<float>(), out.data<float>(), reinterpret_cast<int*>(idx.data<float>()),
+                     B, C, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo, 0);
+    return {std::move(out), std::move(idx)};
+}
+
+Tensor Tensor::maxpool2d_backward(const Tensor& grad, const Tensor& indices, int B, int C, int H, int W) {
+    Tensor g_in({B, C, H, W});
+    int input_total = B * C * H * W;
+    int out_total = grad.size();
+    launch_maxpool2d_backward(grad.data<float>(), reinterpret_cast<const int*>(indices.data<float>()),
+                              g_in.data<float>(), input_total, out_total, 0);
+    return g_in;
 }
 
 // ==================== Factory: full, arange ====================

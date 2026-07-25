@@ -466,6 +466,17 @@ public:
             }, {shared_from_this()});
     }
 
+    GradPtr max_pool2d_(int kH, int kW, int sH, int sW, int pH, int pW) {
+        auto [out, indices] = data.max_pool2d(kH, kW, sH, sW, pH, pW);
+        if (!requires_grad) return make(std::move(out));
+        int B = data.shape()[0], C = data.shape()[1], H = data.shape()[2], W = data.shape()[3];
+        auto idx_ptr = std::make_shared<Tensor>(std::move(indices));
+        return make_with_grad(std::move(out),
+            [B, C, H, W, idx_ptr](const Tensor& g) {
+                return std::vector<Tensor>{Tensor::maxpool2d_backward(g, *idx_ptr, B, C, H, W)};
+            }, {shared_from_this()});
+    }
+
 private:
     static void topo_sort(GradTensor* node, std::vector<GradTensor*>& order,
                           std::unordered_set<GradTensor*>& visited) {
