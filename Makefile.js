@@ -68,6 +68,7 @@ const objs = [...sources.cuda, ...sources.cpp].map(s =>
     `build/obj/${s.replace(/\//g, '_').replace(/\.(cu|cpp)$/, '.obj')}`
 ).join(' ');
 
-execSync(`link /DLL /OUT:build/jstorch.node ${objs} /LIBPATH:"build\\win\\libs\\node" /LIBPATH:"${CUDA_PATH}\\lib\\x64" /LIBPATH:"build\\win\\libs\\cudnn" node.lib cudart.lib cublas.lib cufft.lib curand.lib cudnn.lib`, { stdio: 'inherit' });
+fs.mkdirSync('build/win', { recursive: true });
+execSync(`link /DLL /OUT:build/win/jstorch.node ${objs} /LIBPATH:"build\\win\\libs\\node" /LIBPATH:"${CUDA_PATH}\\lib\\x64" /LIBPATH:"build\\win\\libs\\cudnn" node.lib cudart.lib cublas.lib cufft.lib curand.lib cudnn.lib`, { stdio: 'inherit' });
 
-console.log('\n✓ Build complete: build/jstorch.node\n');
+console.log('\n✓ Build complete: build/win/jstorch.node\n');

@@ -7,7 +7,7 @@
 
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-const native = require('../build/jstorch.node');
+const native = require('../build/win/jstorch.node');
 
 // ==================== Grad context ====================
 let _grad_enabled = true;

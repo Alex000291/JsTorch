@@ -2,7 +2,7 @@
 
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-const native = require('../build/jstorch.node');
+const native = require('../build/win/jstorch.node');
 
 class Optimizer {
     constructor(parameters, defaults) {

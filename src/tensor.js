@@ -9,7 +9,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const dllDirs = ['build/win/dlls/cuda', 'build/win/dlls/cudnn'].map(d => join(__dirname, '..', d));
 process.env.PATH = dllDirs.join(';') + ';' + process.env.PATH;
 
-const native = require('../build/jstorch.node');
+const native = require('../build/win/jstorch.node');
 
 // Scalar ops handled natively in napi.cpp — no JS override needed
 export class Tensor extends native.Tensor {
