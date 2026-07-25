@@ -1,6 +1,8 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cudnn.h>
+#include <map>
+#include <tuple>
 
 namespace jstorch {
 namespace ops {
@@ -479,22 +481,33 @@ void launch_conv2d_cudnn(const float* input, const float* weight, const float* b
     cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH);
     cudnnSetTensor4dDescriptor(yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, B, Co, Ho, Wo);
     
-    // Find best algorithm
-    int returnedCount;
-    cudnnConvolutionFwdAlgoPerf_t perfResults;
-    cudnnGetConvolutionForwardAlgorithm_v7(handle, xDesc, wDesc, convDesc, yDesc, 1, &returnedCount, &perfResults);
-    cudnnConvolutionFwdAlgo_t algo = perfResults.algo;
+    // Cache: algo + workspace (persistent allocation)
+    struct CachedPlan {
+        cudnnConvolutionFwdAlgo_t algo;
+        void* ws; size_t ws_size;
+    };
+    using CacheKey = std::tuple<int,int,int,int,int,int,int,int,int,int,int,int,int,int>;
+    static std::map<CacheKey, CachedPlan> plan_cache;
     
-    // Workspace
-    size_t ws_size = 0;
-    cudnnGetConvolutionForwardWorkspaceSize(handle, xDesc, wDesc, convDesc, yDesc, algo, &ws_size);
-    void* ws = nullptr;
-    if (ws_size > 0) cudaMalloc(&ws, ws_size);
+    auto key = std::make_tuple(B,Ci,H,W,Co,kH,kW,sH,sW,pH,pW,dH,dW,groups);
+    auto it = plan_cache.find(key);
+    CachedPlan plan;
+    if (it != plan_cache.end()) {
+        plan = it->second;
+    } else {
+        int returnedCount;
+        cudnnConvolutionFwdAlgoPerf_t perfResults;
+        cudnnGetConvolutionForwardAlgorithm_v7(handle, xDesc, wDesc, convDesc, yDesc, 1, &returnedCount, &perfResults);
+        plan.algo = perfResults.algo;
+        plan.ws = nullptr; plan.ws_size = 0;
+        cudnnGetConvolutionForwardWorkspaceSize(handle, xDesc, wDesc, convDesc, yDesc, plan.algo, &plan.ws_size);
+        if (plan.ws_size > 0) cudaMalloc(&plan.ws, plan.ws_size);
+        plan_cache[key] = plan;
+    }
     
     float alpha = 1.0f, beta = 0.0f;
-    cudnnConvolutionForward(handle, &alpha, xDesc, input, wDesc, weight, convDesc, algo, ws, ws_size, &beta, yDesc, output);
+    cudnnConvolutionForward(handle, &alpha, xDesc, input, wDesc, weight, convDesc, plan.algo, plan.ws, plan.ws_size, &beta, yDesc, output);
     
-    // Add bias
     if (bias) {
         cudnnCreateTensorDescriptor(&bDesc);
         cudnnSetTensor4dDescriptor(bDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, Co, 1, 1);
@@ -503,7 +516,6 @@ void launch_conv2d_cudnn(const float* input, const float* weight, const float* b
         cudnnDestroyTensorDescriptor(bDesc);
     }
     
-    if (ws) cudaFree(ws);
     cudnnDestroyTensorDescriptor(xDesc);
     cudnnDestroyTensorDescriptor(yDesc);
     cudnnDestroyFilterDescriptor(wDesc);

@@ -1,6 +1,6 @@
 {
   "name": "@alex000291/jstorch",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "A JavaScript version of PyTorch with CUDA acceleration",
   "homepage": "https://github.com/Alex000291/JsTorch#readme",
   "types": "src/index.d.ts",
@@ -16,7 +16,8 @@
   "type": "module",
   "main": "src/index.js",
   "exports": {
-    ".": "./src/index.js"
+    ".": "./src/index.js",
+    "./native": "./src/native.js"
   },
   "scripts": {
     "build": "node Makefile.js",
