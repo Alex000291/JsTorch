@@ -13,6 +13,19 @@ static cudnnHandle_t get_cudnn_handle() {
     return h;
 }
 
+struct ConvParams {
+    int B, Ci, H, W, Co, kH, kW, sH, sW, pH, pW, dH, dW, groups;
+    bool operator<(const ConvParams& o) const {
+        return std::tie(B,Ci,H,W,Co,kH,kW,sH,sW,pH,pW,dH,dW,groups)
+             < std::tie(o.B,o.Ci,o.H,o.W,o.Co,o.kH,o.kW,o.sH,o.sW,o.pH,o.pW,o.dH,o.dW,o.groups);
+    }
+};
+
+struct ConvPlan {
+    cudnnConvolutionFwdAlgo_t algo;
+    void* ws; size_t ws_size;
+};
+
 // === Conv1d via im2col + matmul ===
 
 // im2col: [B, C_in, L_in] -> [B, C_in*K, L_out]
@@ -481,29 +494,20 @@ void launch_conv2d_cudnn(const float* input, const float* weight, const float* b
     cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH);
     cudnnSetTensor4dDescriptor(yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, B, Co, Ho, Wo);
     
-    // Cache: algo + workspace (persistent allocation)
-    struct CachedPlan {
-        cudnnConvolutionFwdAlgo_t algo;
-        void* ws; size_t ws_size;
-    };
-    using CacheKey = std::tuple<int,int,int,int,int,int,int,int,int,int,int,int,int,int>;
-    static std::map<CacheKey, CachedPlan> plan_cache;
-    
-    auto key = std::make_tuple(B,Ci,H,W,Co,kH,kW,sH,sW,pH,pW,dH,dW,groups);
-    auto it = plan_cache.find(key);
-    CachedPlan plan;
-    if (it != plan_cache.end()) {
-        plan = it->second;
-    } else {
-        int returnedCount;
-        cudnnConvolutionFwdAlgoPerf_t perfResults;
-        cudnnGetConvolutionForwardAlgorithm_v7(handle, xDesc, wDesc, convDesc, yDesc, 1, &returnedCount, &perfResults);
-        plan.algo = perfResults.algo;
-        plan.ws = nullptr; plan.ws_size = 0;
-        cudnnGetConvolutionForwardWorkspaceSize(handle, xDesc, wDesc, convDesc, yDesc, plan.algo, &plan.ws_size);
-        if (plan.ws_size > 0) cudaMalloc(&plan.ws, plan.ws_size);
-        plan_cache[key] = plan;
+    static std::map<ConvParams, ConvPlan> plan_cache;
+    ConvParams params{B,Ci,H,W,Co,kH,kW,sH,sW,pH,pW,dH,dW,groups};
+    auto it = plan_cache.find(params);
+    if (it == plan_cache.end()) {
+        ConvPlan p;
+        int count;
+        cudnnConvolutionFwdAlgoPerf_t perf;
+        cudnnGetConvolutionForwardAlgorithm_v7(handle, xDesc, wDesc, convDesc, yDesc, 1, &count, &perf);
+        p.algo = perf.algo; p.ws = nullptr; p.ws_size = 0;
+        cudnnGetConvolutionForwardWorkspaceSize(handle, xDesc, wDesc, convDesc, yDesc, p.algo, &p.ws_size);
+        if (p.ws_size > 0) cudaMalloc(&p.ws, p.ws_size);
+        it = plan_cache.emplace(params, p).first;
     }
+    const auto& plan = it->second;
     
     float alpha = 1.0f, beta = 0.0f;
     cudnnConvolutionForward(handle, &alpha, xDesc, input, wDesc, weight, convDesc, plan.algo, plan.ws, plan.ws_size, &beta, yDesc, output);
