@@ -1,5 +1,9 @@
 // optim.js - Optimizers for JsTorch autograd
 
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const native = require('../build/jstorch.node');
+
 class Optimizer {
     constructor(parameters, defaults) {
         this.parameters = parameters; // GradTensor[]
@@ -67,32 +71,25 @@ class Adam extends Optimizer {
     
     step() {
         this.step_count++;
+        const bc1 = 1 - Math.pow(this.betas[0], this.step_count);
+        const bc2 = 1 - Math.pow(this.betas[1], this.step_count);
         
         for (const param of this.parameters) {
             if (!param.grad) continue;
             
-            let grad = param.grad;
-            
-            if (this.weight_decay !== 0) {
-                grad = grad.add(param.data.mul(this.weight_decay));
-            }
-            
             let s = this.state.get(param);
             if (!s) {
-                s = { m: grad.clone(), v: grad.mul(grad) };
+                // Initialize m and v as zeros with same shape
+                const zeros_buf = new Float32Array(param.data.shape.reduce((a,b) => a*b, 1));
+                s = {
+                    m: native.Tensor.fromBuffer(zeros_buf, [...param.data.shape]),
+                    v: native.Tensor.fromBuffer(zeros_buf, [...param.data.shape])
+                };
                 this.state.set(param, s);
-            } else {
-                s.m = s.m.mul(this.betas[0]).add(grad.mul(1 - this.betas[0]));
-                s.v = s.v.mul(this.betas[1]).add(grad.mul(grad).mul(1 - this.betas[1]));
             }
             
-            const bc1 = 1 - Math.pow(this.betas[0], this.step_count);
-            const bc2 = 1 - Math.pow(this.betas[1], this.step_count);
-            const m_hat = s.m.mul(1.0 / bc1);
-            const v_hat = s.v.mul(1.0 / bc2);
-            
-            const update = m_hat.div(v_hat.sqrt().add(this.eps)).mul(this.lr);
-            param.data = param.data.sub(update);
+            native.Tensor.adamStep(param.data, param.grad, s.m, s.v,
+                this.lr, this.betas[0], this.betas[1], this.eps, bc1, bc2, this.weight_decay);
         }
     }
 }

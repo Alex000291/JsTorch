@@ -212,6 +212,40 @@ __global__ void avgpool2d_backward_kernel(const float* grad_out, float* grad_in,
     }
 }
 
+// === strided copy for contiguous() ===
+struct StridedCopyArgs {
+    int shape[8], src_strides[8], dst_strides[8];
+    int ndim;
+};
+
+__global__ void strided_copy_kernel(const float* src, float* dst, StridedCopyArgs args, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int tmp = idx, src_offset = 0;
+    for (int d = args.ndim - 1; d >= 0; d--) {
+        int coord = tmp % args.shape[d];
+        tmp /= args.shape[d];
+        src_offset += coord * args.src_strides[d];
+    }
+    dst[idx] = src[src_offset];
+}
+
+// === Fused Adam optimizer step ===
+__global__ void adam_step_kernel(
+    float* param, const float* grad, float* m, float* v,
+    float lr, float beta1, float beta2, float eps,
+    float bc1, float bc2, float weight_decay, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= size) return;
+    float g = grad[i] + weight_decay * param[i];
+    float mi = beta1 * m[i] + (1.0f - beta1) * g;
+    float vi = beta2 * v[i] + (1.0f - beta2) * g * g;
+    m[i] = mi; v[i] = vi;
+    float m_hat = mi / bc1;
+    float v_hat = vi / bc2;
+    param[i] -= lr * m_hat / (sqrtf(v_hat) + eps);
+}
+
 // ==================== extern "C" launchers ====================
 extern "C" {
 
@@ -287,6 +321,26 @@ void launch_avgpool2d_backward(const float* grad_out, float* grad_in,
     int total = B * C * Ho * Wo;
     avgpool2d_backward_kernel<<<(total+255)/256, 256, 0, s>>>(
         grad_out, grad_in, B, C, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo, count_include_pad);
+}
+
+void launch_strided_copy(const float* src, float* dst,
+    const int* shape, const int* src_strides, const int* dst_strides,
+    int ndim, int total, cudaStream_t s) {
+    StridedCopyArgs args;
+    args.ndim = ndim;
+    for (int i = 0; i < ndim; i++) {
+        args.shape[i] = shape[i];
+        args.src_strides[i] = src_strides[i];
+        args.dst_strides[i] = dst_strides[i];
+    }
+    strided_copy_kernel<<<(total+255)/256, 256, 0, s>>>(src, dst, args, total);
+}
+
+void launch_adam_step(float* param, const float* grad, float* m, float* v,
+    float lr, float beta1, float beta2, float eps,
+    float bc1, float bc2, float weight_decay, int size, cudaStream_t s) {
+    adam_step_kernel<<<(size+255)/256, 256, 0, s>>>(
+        param, grad, m, v, lr, beta1, beta2, eps, bc1, bc2, weight_decay, size);
 }
 
 }

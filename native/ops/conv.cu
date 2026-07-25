@@ -1,8 +1,15 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cudnn.h>
 
 namespace jstorch {
 namespace ops {
+
+static cudnnHandle_t get_cudnn_handle() {
+    static cudnnHandle_t h = nullptr;
+    if (!h) cudnnCreate(&h);
+    return h;
+}
 
 // === Conv1d via im2col + matmul ===
 
@@ -445,6 +452,62 @@ void launch_conv_transpose2d_backward_weight(
                 &alpha, gc, KK, x, KK, &beta, gw, N);
         }
     }
+}
+
+void launch_conv2d_cudnn(const float* input, const float* weight, const float* bias,
+    float* output,
+    int B, int Ci, int H, int W, int Co, int kH, int kW,
+    int sH, int sW, int pH, int pW, int dH, int dW,
+    int groups, int Ho, int Wo, cudaStream_t s) {
+    
+    cudnnHandle_t handle = get_cudnn_handle();
+    cudnnSetStream(handle, s);
+    
+    cudnnTensorDescriptor_t xDesc, yDesc, bDesc;
+    cudnnFilterDescriptor_t wDesc;
+    cudnnConvolutionDescriptor_t convDesc;
+    
+    cudnnCreateTensorDescriptor(&xDesc);
+    cudnnCreateTensorDescriptor(&yDesc);
+    cudnnCreateFilterDescriptor(&wDesc);
+    cudnnCreateConvolutionDescriptor(&convDesc);
+    
+    cudnnSetTensor4dDescriptor(xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, B, Ci, H, W);
+    cudnnSetFilter4dDescriptor(wDesc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, Co, Ci/groups, kH, kW);
+    cudnnSetConvolution2dDescriptor(convDesc, pH, pW, sH, sW, dH, dW, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
+    cudnnSetConvolutionGroupCount(convDesc, groups);
+    cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH);
+    cudnnSetTensor4dDescriptor(yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, B, Co, Ho, Wo);
+    
+    // Find best algorithm
+    int returnedCount;
+    cudnnConvolutionFwdAlgoPerf_t perfResults;
+    cudnnGetConvolutionForwardAlgorithm_v7(handle, xDesc, wDesc, convDesc, yDesc, 1, &returnedCount, &perfResults);
+    cudnnConvolutionFwdAlgo_t algo = perfResults.algo;
+    
+    // Workspace
+    size_t ws_size = 0;
+    cudnnGetConvolutionForwardWorkspaceSize(handle, xDesc, wDesc, convDesc, yDesc, algo, &ws_size);
+    void* ws = nullptr;
+    if (ws_size > 0) cudaMalloc(&ws, ws_size);
+    
+    float alpha = 1.0f, beta = 0.0f;
+    cudnnConvolutionForward(handle, &alpha, xDesc, input, wDesc, weight, convDesc, algo, ws, ws_size, &beta, yDesc, output);
+    
+    // Add bias
+    if (bias) {
+        cudnnCreateTensorDescriptor(&bDesc);
+        cudnnSetTensor4dDescriptor(bDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, Co, 1, 1);
+        float one = 1.0f;
+        cudnnAddTensor(handle, &one, bDesc, bias, &one, yDesc, output);
+        cudnnDestroyTensorDescriptor(bDesc);
+    }
+    
+    if (ws) cudaFree(ws);
+    cudnnDestroyTensorDescriptor(xDesc);
+    cudnnDestroyTensorDescriptor(yDesc);
+    cudnnDestroyFilterDescriptor(wDesc);
+    cudnnDestroyConvolutionDescriptor(convDesc);
 }
 
 }

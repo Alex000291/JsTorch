@@ -33,7 +33,7 @@ const sources = {
     cuda: ['native/ops/unary.cu', 'native/ops/binary.cu', 'native/ops/reduce.cu', 'native/ops/misc.cu', 'native/ops/matmul.cu', 'native/ops/conv.cu', 'native/audio/stft.cu']
 };
 
-const includes = `-Inode_modules\\node-addon-api -Inode_modules\\node-api-headers\\include -I"${CUDA_PATH}\\include" -Inative/core -Inative/ops`;
+const includes = `-Inode_modules\\node-addon-api -Inode_modules\\node-api-headers\\include -I"${CUDA_PATH}\\include" -Ibuild\\win\\include -Inative/core -Inative/ops`;
 
 // Compile CUDA
 console.log('Compiling CUDA...');
@@ -68,6 +68,6 @@ const objs = [...sources.cuda, ...sources.cpp].map(s =>
     `build/obj/${s.replace(/\//g, '_').replace(/\.(cu|cpp)$/, '.obj')}`
 ).join(' ');
 
-execSync(`link /DLL /OUT:build/jstorch.node ${objs} /LIBPATH:"build\\win\\libs\\node" /LIBPATH:"${CUDA_PATH}\\lib\\x64" node.lib cudart.lib cublas.lib cufft.lib curand.lib`, { stdio: 'inherit' });
+execSync(`link /DLL /OUT:build/jstorch.node ${objs} /LIBPATH:"build\\win\\libs\\node" /LIBPATH:"${CUDA_PATH}\\lib\\x64" /LIBPATH:"build\\win\\libs\\cudnn" node.lib cudart.lib cublas.lib cufft.lib curand.lib cudnn.lib`, { stdio: 'inherit' });
 
 console.log('\n✓ Build complete: build/jstorch.node\n');

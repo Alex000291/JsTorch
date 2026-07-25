@@ -158,6 +158,10 @@ public:
     static Tensor arange(float start, float end, float step = 1.0f);
     Tensor randn_like() const;
     std::vector<float> to_array() const;
+    
+    // Fused Adam optimizer step
+    static void adam_step(Tensor& param, const Tensor& grad, Tensor& m, Tensor& v,
+        float lr, float beta1, float beta2, float eps, float bc1, float bc2, float weight_decay);
 };
 
 }

@@ -162,6 +162,7 @@ public: // data_ needs friend access from static methods
             StaticMethod("fromIntArray", &TensorWrap::FromIntArray),
             StaticMethod("full", &TensorWrap::Full),
             StaticMethod("arange", &TensorWrap::Arange),
+            StaticMethod("adamStep", &TensorWrap::AdamStep),
         });
         
         auto* ctor = new Napi::FunctionReference();
@@ -599,6 +600,23 @@ public: // data_ needs friend access from static methods
             data.push_back(arr.Get(i).As<Napi::Number>().Int32Value());
         Shape shape = info.Length() > 1 ? parseShape(info, 1) : Shape{(int)data.size()};
         return Wrap(env, Tensor::from_int_array(data.data(), shape));
+    }
+
+    static Napi::Value AdamStep(const Napi::CallbackInfo& info) {
+        auto* param = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        auto* grad = Napi::ObjectWrap<TensorWrap>::Unwrap(info[1].As<Napi::Object>());
+        auto* m = Napi::ObjectWrap<TensorWrap>::Unwrap(info[2].As<Napi::Object>());
+        auto* v = Napi::ObjectWrap<TensorWrap>::Unwrap(info[3].As<Napi::Object>());
+        float lr = info[4].As<Napi::Number>().FloatValue();
+        float beta1 = info[5].As<Napi::Number>().FloatValue();
+        float beta2 = info[6].As<Napi::Number>().FloatValue();
+        float eps = info[7].As<Napi::Number>().FloatValue();
+        float bc1 = info[8].As<Napi::Number>().FloatValue();
+        float bc2 = info[9].As<Napi::Number>().FloatValue();
+        float wd = info[10].As<Napi::Number>().FloatValue();
+        Tensor::adam_step(param->tensor(), grad->tensor(), m->tensor(), v->tensor(),
+            lr, beta1, beta2, eps, bc1, bc2, wd);
+        return info.Env().Undefined();
     }
 };
 

@@ -1,6 +1,14 @@
 // tensor.js - Tensor JS wrapper
 import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 const require = createRequire(import.meta.url);
+
+// Add DLL directories to PATH before loading native module
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const dllDirs = ['build/win/dlls/cuda', 'build/win/dlls/cudnn'].map(d => join(__dirname, '..', d));
+process.env.PATH = dllDirs.join(';') + ';' + process.env.PATH;
+
 const native = require('../build/jstorch.node');
 
 // Scalar ops handled natively in napi.cpp — no JS override needed

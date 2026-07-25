@@ -1,4 +1,5 @@
 #include "tensor.hpp"
+#include "allocator.hpp"
 #include <stdexcept>
 #include <cstdlib>
 #include <ctime>
@@ -93,6 +94,14 @@ extern "C" {
         int, int, int, int, int, int, int, int, int, int, cudaStream_t);
     void launch_conv_transpose2d_backward_weight(const float*, const float*, float*, float*,
         int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, cudaStream_t);
+    
+    // GPU contiguous copy
+    void launch_strided_copy(const float*, float*, const int*, const int*, const int*, int, int, cudaStream_t);
+    // Fused Adam
+    void launch_adam_step(float*, const float*, float*, float*, float, float, float, float, float, float, float, int, cudaStream_t);
+    // cuDNN conv2d
+    void launch_conv2d_cudnn(const float*, const float*, const float*, float*,
+        int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, cudaStream_t);
 }
 
 // ==================== Helpers ====================
@@ -123,8 +132,8 @@ Tensor::Tensor(const Shape& shape, DType dtype)
     : dtype_(dtype), shape_(shape), strides_(compute_strides(shape)),
       stream_(0), owns_stream_(false) {
     size_t bytes = size() * dtype_size(dtype_);
-    void* ptr; cudaMalloc(&ptr, bytes); cudaMemset(ptr, 0, bytes);
-    data_ = std::shared_ptr<void>(ptr, [](void* p) { cudaFree(p); });
+    void* ptr = get_allocator().allocate(bytes);
+    data_ = std::shared_ptr<void>(ptr, [bytes](void* p) { get_allocator().free(p, bytes); });
 }
 
 Tensor::Tensor(std::shared_ptr<void> data, const Shape& shape, const Strides& strides,
@@ -143,10 +152,11 @@ Tensor Tensor::clone() const {
 
 Tensor Tensor::contiguous() const {
     if (is_contiguous()) return *this;
-    // Need to actually copy with stride support
     Tensor r(shape_, dtype_);
-    auto src = to_array();
-    cudaMemcpy(r.data<float>(), src.data(), src.size() * sizeof(float), cudaMemcpyHostToDevice);
+    auto dst_strides = compute_strides(shape_);
+    launch_strided_copy(data<float>(), r.data<float>(),
+        shape_.data(), strides_.data(), dst_strides.data(),
+        ndim(), size(), 0);
     return r;
 }
 
@@ -239,7 +249,7 @@ Tensor Tensor::name() const { \
     Tensor c = contiguous(); \
     Tensor r(shape_, dtype_); \
     launcher(c.data<float>(), r.data<float>(), size(), 0); \
-    cudaDeviceSynchronize(); return r; \
+    return r; \
 }
 
 UNARY(abs, launch_abs)   UNARY(sqrt, launch_sqrt)   UNARY(square, launch_square)
@@ -253,43 +263,43 @@ UNARY(log1p, launch_log1p) UNARY(reciprocal, launch_reciprocal) UNARY(sign, laun
 Tensor Tensor::leaky_relu(float slope) const {
     Tensor c = contiguous(); Tensor r(shape_, dtype_);
     launch_leaky_relu(c.data<float>(), r.data<float>(), size(), slope, 0);
-    cudaDeviceSynchronize(); return r;
+    return r;
 }
 
 Tensor Tensor::clamp(float lo, float hi) const {
     Tensor c = contiguous(); Tensor r(shape_, dtype_);
     launch_clamp(c.data<float>(), r.data<float>(), size(), lo, hi, 0);
-    cudaDeviceSynchronize(); return r;
+    return r;
 }
 Tensor Tensor::clamp_min(float lo) const {
     Tensor c = contiguous(); Tensor r(shape_, dtype_);
     launch_clamp_min(c.data<float>(), r.data<float>(), size(), lo, 0);
-    cudaDeviceSynchronize(); return r;
+    return r;
 }
 Tensor Tensor::clamp_max(float hi) const {
     Tensor c = contiguous(); Tensor r(shape_, dtype_);
     launch_clamp_max(c.data<float>(), r.data<float>(), size(), hi, 0);
-    cudaDeviceSynchronize(); return r;
+    return r;
 }
 Tensor Tensor::fmod(float d) const {
     Tensor c = contiguous(); Tensor r(shape_, dtype_);
     launch_fmod(c.data<float>(), r.data<float>(), size(), d, 0);
-    cudaDeviceSynchronize(); return r;
+    return r;
 }
 Tensor Tensor::pow_scalar(float e) const {
     Tensor c = contiguous(); Tensor r(shape_, dtype_);
     launch_pow_scalar(c.data<float>(), r.data<float>(), size(), e, 0);
-    cudaDeviceSynchronize(); return r;
+    return r;
 }
 Tensor Tensor::mul_scalar(float s) const {
     Tensor c = contiguous(); Tensor r(shape_, dtype_);
     launch_mul_scalar(c.data<float>(), r.data<float>(), size(), s, 0);
-    cudaDeviceSynchronize(); return r;
+    return r;
 }
 Tensor Tensor::add_scalar(float s) const {
     Tensor c = contiguous(); Tensor r(shape_, dtype_);
     launch_add_scalar(c.data<float>(), r.data<float>(), size(), s, 0);
-    cudaDeviceSynchronize(); return r;
+    return r;
 }
 
 // ==================== Binary ops ====================
@@ -302,10 +312,7 @@ Tensor Tensor::name(const Tensor& o) const { \
     auto bst = contiguous_strides_for_broadcast(o.shape_, o.is_contiguous() ? compute_strides(o.shape_) : o.strides_, nd); \
     Tensor ca = contiguous(), cb = o.contiguous(); \
     Tensor r(s, dtype_); \
-    int *das=to_device(as), *dast=to_device(ast), *dbs=to_device(bs), *dbst=to_device(bst), *dos=to_device(s); \
-    launcher(ca.data<float>(), das, dast, cb.data<float>(), dbs, dbst, r.data<float>(), dos, nd, r.size(), 0); \
-    cudaDeviceSynchronize(); \
-    cudaFree(das); cudaFree(dast); cudaFree(dbs); cudaFree(dbst); cudaFree(dos); \
+    launcher(ca.data<float>(), as.data(), ast.data(), cb.data<float>(), bs.data(), bst.data(), r.data<float>(), s.data(), nd, r.size(), 0); \
     return r; \
 }
 
@@ -333,7 +340,7 @@ Tensor Tensor::sum(int dim, bool keepdim) const {
     if (os.empty()) os.push_back(1);
     Tensor r(os, dtype_);
     launch_reduce_sum(c.data<float>(), r.data<float>(), outer, shape_[dim], inner, 0);
-    cudaDeviceSynchronize(); return r;
+    return r;
 }
 
 Tensor Tensor::mean(int dim, bool keepdim) const {
@@ -351,7 +358,7 @@ Tensor Tensor::mean(int dim, bool keepdim) const {
     if (os.empty()) os.push_back(1);
     Tensor r(os, dtype_);
     launch_reduce_mean(c.data<float>(), r.data<float>(), outer, shape_[dim], inner, 0);
-    cudaDeviceSynchronize(); return r;
+    return r;
 }
 
 // ==================== reduce max/min/argmax/argmin ====================
@@ -375,7 +382,7 @@ Tensor Tensor::max(int dim, bool keepdim) const {
     compute_reduce_params(shape_, dim, ndim(), keepdim, outer, inner, os);
     Tensor r(os, dtype_);
     launch_reduce_max(c.data<float>(), r.data<float>(), nullptr, outer, shape_[dim], inner, 0);
-    cudaDeviceSynchronize(); return r;
+    return r;
 }
 
 Tensor Tensor::min(int dim, bool keepdim) const {
@@ -385,7 +392,7 @@ Tensor Tensor::min(int dim, bool keepdim) const {
     compute_reduce_params(shape_, dim, ndim(), keepdim, outer, inner, os);
     Tensor r(os, dtype_);
     launch_reduce_min(c.data<float>(), r.data<float>(), nullptr, outer, shape_[dim], inner, 0);
-    cudaDeviceSynchronize(); return r;
+    return r;
 }
 
 Tensor Tensor::argmax(int dim) const {
@@ -447,14 +454,10 @@ Tensor Tensor::conv2d(const Tensor& weight, const Tensor* bias,
     int Co = weight.shape()[0], kH = weight.shape()[2], kW = weight.shape()[3];
     int Ho = (H + 2*pH - dH*(kH-1) - 1) / sH + 1;
     int Wo = (W + 2*pW - dW*(kW-1) - 1) / sW + 1;
-    int col_size = B * Ci * kH * kW * Ho * Wo;
-    float* col; cudaMalloc(&col, col_size * sizeof(float));
     Tensor r({B, Co, Ho, Wo}, dtype_);
     const float* b_ptr = bias ? bias->data<float>() : nullptr;
-    launch_conv2d(ci.data<float>(), cw.data<float>(), b_ptr, r.data<float>(), col,
+    launch_conv2d_cudnn(ci.data<float>(), cw.data<float>(), b_ptr, r.data<float>(),
         B, Ci, H, W, Co, kH, kW, sH, sW, pH, pW, dH, dW, groups, Ho, Wo, 0);
-    cudaDeviceSynchronize();
-    cudaFree(col);
     return r;
 }
 
@@ -472,7 +475,6 @@ Tensor Tensor::conv_transpose2d(const Tensor& weight, const Tensor* bias,
     const float* b_ptr = bias ? bias->data<float>() : nullptr;
     launch_conv_transpose2d(ci.data<float>(), cw.data<float>(), b_ptr, r.data<float>(), col,
         B, Ci, Hi, Wi, Co, kH, kW, sH, sW, pH, pW, dH, dW, groups, Ho, Wo, 0);
-    cudaDeviceSynchronize();
     cudaFree(col);
     return r;
 }
@@ -484,7 +486,6 @@ Tensor Tensor::avg_pool2d(int kH, int kW, int sH, int sW, int pH, int pW, bool c
     int Wo = (W + 2*pW - kW) / sW + 1;
     Tensor r({B, C, Ho, Wo}, dtype_);
     launch_avgpool2d(c.data<float>(), r.data<float>(), B, C, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo, count_include_pad, 0);
-    cudaDeviceSynchronize();
     return r;
 }
 
@@ -493,7 +494,6 @@ Tensor Tensor::full(const Shape& shape, float value) {
     Tensor r(shape);
     // Fill via add_scalar on zero tensor
     launch_add_scalar(r.data<float>(), r.data<float>(), r.size(), value, 0);
-    cudaDeviceSynchronize();
     return r;
 }
 
@@ -530,7 +530,6 @@ Tensor Tensor::cat(const std::vector<Tensor>& tensors, int dim) {
         launch_cat(tc.data<float>(), r.data<float>(), outer, tc.shape()[dim], total_dim, inner, offset, 0);
         offset += tc.shape()[dim];
     }
-    cudaDeviceSynchronize();
     return r;
 }
 
@@ -542,7 +541,6 @@ Tensor Tensor::flip(int dim) const {
     int* ds = to_device(shape_);
     int* dst = to_device(compute_strides(shape_));
     launch_flip(c.data<float>(), r.data<float>(), ds, dst, ndim(), dim, size(), 0);
-    cudaDeviceSynchronize();
     cudaFree(ds); cudaFree(dst);
     return r;
 }
@@ -566,7 +564,6 @@ Tensor Tensor::pad(const std::vector<int>& padding, int mode, float value) const
     int* dos = to_device(os);
     int* dpb = to_device(pad_before);
     launch_pad(c.data<float>(), r.data<float>(), dis, dos, dpb, nd, r.size(), value, mode, 0);
-    cudaDeviceSynchronize();
     cudaFree(dis); cudaFree(dos); cudaFree(dpb);
     return r;
 }
@@ -580,7 +577,6 @@ Tensor Tensor::cumsum(int dim) const {
     for (int i = dim + 1; i < ndim(); i++) inner *= shape_[i];
     Tensor r(shape_, dtype_);
     launch_cumsum(c.data<float>(), r.data<float>(), outer, shape_[dim], inner, 0);
-    cudaDeviceSynchronize();
     return r;
 }
 
@@ -590,7 +586,6 @@ Tensor Tensor::where(const Tensor& cond, const Tensor& x, const Tensor& y) {
     Tensor cc = cond.contiguous(), cx = x.contiguous(), cy = y.contiguous();
     Tensor r(cc.shape(), cc.dtype());
     launch_where(cc.data<float>(), cx.data<float>(), cy.data<float>(), r.data<float>(), r.size(), 0);
-    cudaDeviceSynchronize();
     return r;
 }
 
@@ -602,13 +597,13 @@ Tensor Tensor::matmul(const Tensor& other) const {
         if (other.shape_[0] != K) throw std::runtime_error("matmul shape mismatch");
         Tensor r({M, N}, dtype_);
         launch_matmul(ca.data<float>(), cb.data<float>(), r.data<float>(), M, K, N, 0);
-        cudaDeviceSynchronize(); return r;
+        return r;
     }
     if (ndim() == 3 && other.ndim() == 3) {
         int B = shape_[0], M = shape_[1], K = shape_[2], N = other.shape_[2];
         Tensor r({B, M, N}, dtype_);
         launch_bmm(ca.data<float>(), cb.data<float>(), r.data<float>(), B, M, K, N, 0);
-        cudaDeviceSynchronize(); return r;
+        return r;
     }
     // 2D x 1D -> 1D (matrix-vector)
     if (ndim() == 2 && other.ndim() == 1) {
@@ -616,7 +611,6 @@ Tensor Tensor::matmul(const Tensor& other) const {
         Tensor ob = cb.unsqueeze(1); // [K,1]
         Tensor r({M, 1}, dtype_);
         launch_matmul(ca.data<float>(), ob.data<float>(), r.data<float>(), M, K, 1, 0);
-        cudaDeviceSynchronize();
         return r.squeeze(1);
     }
     throw std::runtime_error("matmul: unsupported dims");
@@ -632,7 +626,6 @@ Tensor Tensor::embedding(const Tensor& indices) const {
     Tensor r(os, dtype_);
     Tensor cw = contiguous();
     launch_embedding(cw.data<float>(), indices.data<int>(), r.data<float>(), num_indices, embed_dim, 0);
-    cudaDeviceSynchronize();
     return r;
 }
 
@@ -653,7 +646,6 @@ Tensor Tensor::conv1d(const Tensor& weight, const Tensor* bias,
     const float* b_ptr = bias ? bias->data<float>() : nullptr;
     launch_conv1d(ci.data<float>(), cw.data<float>(), b_ptr, r.data<float>(), col_buf,
         B, C_in, L_in, C_out, K, stride, padding, dilation, groups, L_out, 0);
-    cudaDeviceSynchronize();
     cudaFree(col_buf);
     return r;
 }
@@ -673,7 +665,6 @@ Tensor Tensor::conv_transpose1d(const Tensor& weight, const Tensor* bias,
     const float* b_ptr = bias ? bias->data<float>() : nullptr;
     launch_conv_transpose1d(ci.data<float>(), cw.data<float>(), b_ptr, r.data<float>(), col_buf,
         B, C_in, L_in, C_out, K, stride, padding, dilation, groups, L_out, 0);
-    cudaDeviceSynchronize();
     cudaFree(col_buf);
     return r;
 }
@@ -688,7 +679,6 @@ Tensor Tensor::interpolate(int target_size, int mode, bool align_corners) const 
     Shape os = shape_; os[ndim() - 1] = target_size;
     Tensor r(os, dtype_);
     launch_interp1d(c.data<float>(), r.data<float>(), bc, in_len, target_size, mode, align_corners, 0);
-    cudaDeviceSynchronize();
     return r;
 }
 
@@ -710,7 +700,6 @@ Tensor Tensor::randn(const Shape& shape) {
     Tensor r(shape);
     static unsigned long long seed_counter = 42;
     launch_randn(r.data<float>(), r.size(), seed_counter++, 0);
-    cudaDeviceSynchronize();
     return r;
 }
 
@@ -732,9 +721,11 @@ Tensor Tensor::from_int_array(const int* data, const Shape& shape) {
 std::vector<float> Tensor::to_array() const {
     if (is_contiguous()) {
         std::vector<float> result(size());
+        cudaDeviceSynchronize();
         cudaMemcpy(result.data(), data<float>(), size() * sizeof(float), cudaMemcpyDeviceToHost);
         return result;
     }
+    cudaDeviceSynchronize();
     int max_offset = 0;
     for (int i = 0; i < ndim(); i++)
         max_offset += (shape_[i] - 1) * strides_[i];
@@ -765,7 +756,6 @@ Tensor Tensor::scatter_add(const Tensor& grad, const Tensor& indices, int vocab_
     Tensor r({vocab_size, embed_dim}, grad.dtype());
     launch_scatter_add(grad.data<float>(), indices.data<int>(), r.data<float>(),
         num_indices, embed_dim, vocab_size, 0);
-    cudaDeviceSynchronize();
     return r;
 }
 
@@ -779,7 +769,6 @@ Tensor Tensor::interp1d_backward(int in_len, int mode, bool align_corners) const
     Shape os = shape_; os[ndim() - 1] = in_len;
     Tensor r(os, dtype_);
     launch_interp1d_backward(c.data<float>(), r.data<float>(), bc, in_len, out_len, mode, align_corners, 0);
-    cudaDeviceSynchronize();
     return r;
 }
 
@@ -791,7 +780,6 @@ Tensor Tensor::avgpool2d_backward(int H, int W, int kH, int kW, int sH, int sW, 
     Tensor r({B, C, H, W}, dtype_);
     launch_avgpool2d_backward(c.data<float>(), r.data<float>(),
         B, C, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo, cip, 0);
-    cudaDeviceSynchronize();
     return r;
 }
 
@@ -806,7 +794,6 @@ Tensor Tensor::conv1d_backward_weight(const Tensor& input, const Tensor& grad_ou
     float* col_buf; cudaMalloc(&col_buf, col_size * sizeof(float));
     launch_conv1d_backward_weight(ci.data<float>(), cg.data<float>(), gw.data<float>(), col_buf,
         B, C_in, L_in, C_out, K, stride, padding, dilation, groups, L_out, 0);
-    cudaDeviceSynchronize();
     cudaFree(col_buf);
     return gw;
 }
@@ -822,7 +809,6 @@ Tensor Tensor::conv2d_backward_weight(const Tensor& input, const Tensor& grad_ou
     float* col_buf; cudaMalloc(&col_buf, col_size * sizeof(float));
     launch_conv2d_backward_weight(ci.data<float>(), cg.data<float>(), gw.data<float>(), col_buf,
         B, Ci, H, W, Co, kH, kW, sH, sW, pH, pW, dH, dW, groups, Ho, Wo, 0);
-    cudaDeviceSynchronize();
     cudaFree(col_buf);
     return gw;
 }
@@ -839,7 +825,6 @@ Tensor Tensor::conv_transpose1d_backward_weight(const Tensor& input, const Tenso
     float* col_buf; cudaMalloc(&col_buf, col_size * sizeof(float));
     launch_conv_transpose1d_backward_weight(ci.data<float>(), cg.data<float>(), gw.data<float>(), col_buf,
         B, C_in, L_in, C_out, K, stride, padding, dilation, groups, L_out, 0);
-    cudaDeviceSynchronize();
     cudaFree(col_buf);
     return gw;
 }
@@ -855,7 +840,6 @@ Tensor Tensor::conv_transpose2d_backward_weight(const Tensor& input, const Tenso
     float* col_buf; cudaMalloc(&col_buf, col_size * sizeof(float));
     launch_conv_transpose2d_backward_weight(ci.data<float>(), cg.data<float>(), gw.data<float>(), col_buf,
         B, Ci, Hi, Wi, Co, kH, kW, sH, sW, pH, pW, dH, dW, groups, Ho, Wo, 0);
-    cudaDeviceSynchronize();
     cudaFree(col_buf);
     return gw;
 }
@@ -864,5 +848,11 @@ Tensor Tensor::conv_transpose2d_backward_weight(const Tensor& input, const Tenso
 Tensor Tensor::real() const { throw std::runtime_error("Not implemented"); }
 Tensor Tensor::imag() const { throw std::runtime_error("Not implemented"); }
 Tensor Tensor::from_real_imag(const Tensor&, const Tensor&) { throw std::runtime_error("Not implemented"); }
+
+void Tensor::adam_step(Tensor& param, const Tensor& grad, Tensor& m, Tensor& v,
+    float lr, float beta1, float beta2, float eps, float bc1, float bc2, float weight_decay) {
+    launch_adam_step(param.data<float>(), grad.data<float>(), m.data<float>(), v.data<float>(),
+        lr, beta1, beta2, eps, bc1, bc2, weight_decay, param.size(), 0);
+}
 
 }

@@ -2,6 +2,7 @@ node_modules
 .letta
 build/win/dlls/
 build/win/libs/
+build/win/include/
 native/cpp_obj/
 native/cu_obj/
 

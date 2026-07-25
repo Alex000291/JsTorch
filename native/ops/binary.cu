@@ -5,26 +5,32 @@ namespace ops {
 
 constexpr int MAX_DIMS = 8;
 
+struct BroadcastArgs {
+    int a_shape[MAX_DIMS], a_strides[MAX_DIMS];
+    int b_shape[MAX_DIMS], b_strides[MAX_DIMS];
+    int out_shape[MAX_DIMS];
+    int ndim;
+};
+
 template<typename BinaryOp>
 __global__ void broadcast_kernel(
-    const float* a, const int* a_shape, const int* a_strides,
-    const float* b, const int* b_shape, const int* b_strides,
-    float* out, const int* out_shape, int ndim, int total_size, BinaryOp op
+    const float* a, const float* b,
+    float* out, BroadcastArgs args, int total_size, BinaryOp op
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_size) return;
     
     int indices[MAX_DIMS];
     int tmp = idx;
-    for (int i = ndim - 1; i >= 0; i--) {
-        indices[i] = tmp % out_shape[i];
-        tmp /= out_shape[i];
+    for (int i = args.ndim - 1; i >= 0; i--) {
+        indices[i] = tmp % args.out_shape[i];
+        tmp /= args.out_shape[i];
     }
     
     int a_idx = 0, b_idx = 0;
-    for (int i = 0; i < ndim; i++) {
-        a_idx += (a_shape[i] == 1 ? 0 : indices[i]) * a_strides[i];
-        b_idx += (b_shape[i] == 1 ? 0 : indices[i]) * b_strides[i];
+    for (int i = 0; i < args.ndim; i++) {
+        a_idx += (args.a_shape[i] == 1 ? 0 : indices[i]) * args.a_strides[i];
+        b_idx += (args.b_shape[i] == 1 ? 0 : indices[i]) * args.b_strides[i];
     }
     
     out[idx] = op(a[a_idx], b[b_idx]);
@@ -58,11 +64,18 @@ void launch_broadcast(
     float* out, const int* out_shape, int ndim, int total_size,
     BinaryOp op, cudaStream_t stream
 ) {
+    BroadcastArgs args;
+    args.ndim = ndim;
+    for (int i = 0; i < ndim; i++) {
+        args.a_shape[i] = a_shape[i];
+        args.a_strides[i] = a_strides[i];
+        args.b_shape[i] = b_shape[i];
+        args.b_strides[i] = b_strides[i];
+        args.out_shape[i] = out_shape[i];
+    }
     int threads = 256;
     int blocks = (total_size + threads - 1) / threads;
-    broadcast_kernel<<<blocks, threads, 0, stream>>>(
-        a, a_shape, a_strides, b, b_shape, b_strides, out, out_shape, ndim, total_size, op
-    );
+    broadcast_kernel<<<blocks, threads, 0, stream>>>(a, b, out, args, total_size, op);
 }
 
 // Macro to reduce boilerplate
