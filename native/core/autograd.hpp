@@ -432,26 +432,24 @@ public:
 
         Tensor saved_x = data, saved_w = weight->data;
         Shape x_shape = data.shape();
+        Shape w_shape = weight->data.shape();
         bool has_bias = (bias != nullptr);
         auto self = shared_from_this();
         std::vector<GradPtr> par = {self, weight};
         if (bias) par.push_back(bias);
 
         return make_with_grad(std::move(out),
-            [saved_x, saved_w, x_shape, sH, sW, pH, pW, dH, dW, groups, has_bias](const Tensor& g) {
-                Tensor dx = g.conv_transpose2d(saved_w, nullptr, sH, sW, pH, pW, 0, 0, dH, dW, groups);
-                int Ci_g = x_shape[1] / groups;
-                int kH = saved_w.shape()[2], kW = saved_w.shape()[3];
-                Tensor dw = Tensor::conv2d_backward_weight(saved_x, g, Ci_g, kH, kW, sH, sW, pH, pW, dH, dW, groups);
-                std::vector<Tensor> result = {dx, dw};
+            [saved_x, saved_w, x_shape, w_shape, sH, sW, pH, pW, dH, dW, groups, has_bias](const Tensor& g) {
+                Tensor dx(x_shape), dw(w_shape);
                 if (has_bias) {
-                    // bias grad = sum over batch and spatial dims
-                    Tensor db = g.sum(0, false);
-                    for (int d = db.ndim() - 1; d >= 1; d--)
-                        db = db.sum(d, false);
-                    result.push_back(db);
+                    int Co = w_shape[0];
+                    Tensor db({Co});
+                    Tensor::conv2d_backward_cudnn(saved_x, saved_w, g, dx, dw, &db, sH, sW, pH, pW, dH, dW, groups);
+                    return std::vector<Tensor>{dx, dw, db};
+                } else {
+                    Tensor::conv2d_backward_cudnn(saved_x, saved_w, g, dx, dw, nullptr, sH, sW, pH, pW, dH, dW, groups);
+                    return std::vector<Tensor>{dx, dw};
                 }
-                return result;
             }, par);
     }
 
@@ -504,14 +502,17 @@ enum class OpType : uint8_t {
     // Reduce
     SUM, MEAN,
     // View
-    TRANSPOSE, TRANSPOSE2,
+    TRANSPOSE, TRANSPOSE2, RESHAPE,
+    // CNN
+    CONV2D, MAX_POOL2D, AVG_POOL2D, BATCH_NORM2D, FLATTEN,
 };
 
 struct TracedOp {
     OpType type;
-    int16_t out, in0, in1;
+    int16_t out, in0, in1, in2;   // in2 for conv bias / bn weight
+    int16_t in3;                   // bn bias
     float fparam;
-    int iparam0, iparam1;
+    int iparams[8];                // flexible int params (stride/pad/etc + shape)
 };
 
 class CompiledGraph {
@@ -519,6 +520,7 @@ class CompiledGraph {
     int num_slots_ = 0;
     int input_slot_ = -1, target_slot_ = -1, output_slot_ = -1;
     std::vector<int> param_slots_;
+    std::vector<int> buffer_slots_;
 
 public:
     int alloc() { return num_slots_++; }
@@ -530,28 +532,92 @@ public:
         param_slots_.push_back(s);
         return s;
     }
+    // Buffer: non-trainable tensor (e.g. BN running stats)
+    int buffer() {
+        int s = alloc();
+        buffer_slots_.push_back(s);
+        return s;
+    }
     void set_output(int s) { output_slot_ = s; }
 
     // Op builders — return output slot
     int op1(OpType t, int a, float fp = 0, int ip0 = 0, int ip1 = 0) {
         int o = alloc();
-        ops_.push_back({t, (int16_t)o, (int16_t)a, -1, fp, ip0, ip1});
+        TracedOp op{t, (int16_t)o, (int16_t)a, -1, -1, -1, fp, {}};
+        op.iparams[0] = ip0; op.iparams[1] = ip1;
+        ops_.push_back(op);
         return o;
     }
     int op2(OpType t, int a, int b) {
         int o = alloc();
-        ops_.push_back({t, (int16_t)o, (int16_t)a, (int16_t)b, 0, 0, 0});
+        TracedOp op{t, (int16_t)o, (int16_t)a, (int16_t)b, -1, -1, 0, {}};
+        ops_.push_back(op);
+        return o;
+    }
+    // Conv2d: input, weight, bias(-1 if none), sH, sW, pH, pW, dH, dW, groups
+    int conv2d(int input, int weight, int bias, int sH, int sW, int pH, int pW, int dH, int dW, int groups) {
+        int o = alloc();
+        TracedOp op{OpType::CONV2D, (int16_t)o, (int16_t)input, (int16_t)weight, (int16_t)bias, -1, 0, {}};
+        op.iparams[0]=sH; op.iparams[1]=sW; op.iparams[2]=pH; op.iparams[3]=pW;
+        op.iparams[4]=dH; op.iparams[5]=dW; op.iparams[6]=groups;
+        ops_.push_back(op);
+        return o;
+    }
+    // MaxPool2d: kH, kW, sH, sW, pH, pW
+    int max_pool2d(int input, int kH, int kW, int sH, int sW, int pH, int pW) {
+        int o = alloc();
+        TracedOp op{OpType::MAX_POOL2D, (int16_t)o, (int16_t)input, -1, -1, -1, 0, {}};
+        op.iparams[0]=kH; op.iparams[1]=kW; op.iparams[2]=sH; op.iparams[3]=sW;
+        op.iparams[4]=pH; op.iparams[5]=pW;
+        ops_.push_back(op);
+        return o;
+    }
+    // AvgPool2d: kH, kW, sH, sW, pH, pW, count_include_pad
+    int avg_pool2d(int input, int kH, int kW, int sH, int sW, int pH, int pW, bool cip = true) {
+        int o = alloc();
+        TracedOp op{OpType::AVG_POOL2D, (int16_t)o, (int16_t)input, -1, -1, -1, 0, {}};
+        op.iparams[0]=kH; op.iparams[1]=kW; op.iparams[2]=sH; op.iparams[3]=sW;
+        op.iparams[4]=pH; op.iparams[5]=pW; op.iparams[6]=cip?1:0;
+        ops_.push_back(op);
+        return o;
+    }
+    // BatchNorm2d: input, weight(gamma), bias(beta), running_mean, running_var
+    int batch_norm2d(int input, int weight, int bias, int rmean, int rvar, float eps = 1e-5f) {
+        int o = alloc();
+        TracedOp op{OpType::BATCH_NORM2D, (int16_t)o, (int16_t)input, (int16_t)weight, (int16_t)bias, (int16_t)rmean, eps, {}};
+        op.iparams[0] = rvar;  // store running_var slot in iparams[0]
+        ops_.push_back(op);
+        return o;
+    }
+    // Flatten from start_dim (default 1) — [B, C, H, W] -> [B, C*H*W]
+    int flatten(int input, int start_dim = 1) {
+        int o = alloc();
+        TracedOp op{OpType::FLATTEN, (int16_t)o, (int16_t)input, -1, -1, -1, 0, {}};
+        op.iparams[0] = start_dim;
+        ops_.push_back(op);
+        return o;
+    }
+    // Reshape: input, shape (up to 6 dims, -1 terminated)
+    int reshape(int input, const std::vector<int>& shape) {
+        int o = alloc();
+        TracedOp op{OpType::RESHAPE, (int16_t)o, (int16_t)input, -1, -1, -1, 0, {}};
+        for (int i = 0; i < (int)shape.size() && i < 8; i++) op.iparams[i] = shape[i];
+        if ((int)shape.size() < 8) op.iparams[shape.size()] = INT_MIN; // sentinel
+        ops_.push_back(op);
         return o;
     }
 
     int num_params() const { return (int)param_slots_.size(); }
+
+    int num_buffers() const { return (int)buffer_slots_.size(); }
 
     // Execute forward + backward, write gradients back into param tensors
     void run(const Tensor& input, const Tensor& target,
              std::vector<Tensor>& params,       // in: param data, modified in-place by adam
              std::vector<Tensor>& m_states,      // adam m
              std::vector<Tensor>& v_states,      // adam v
-             float lr, float beta1, float beta2, float eps, float bc1, float bc2, float wd) {
+             float lr, float beta1, float beta2, float eps, float bc1, float bc2, float wd,
+             std::vector<Tensor>* buffers = nullptr) {
 
         int np = (int)params.size();
         std::vector<GradPtr> slots(num_slots_);
@@ -562,6 +628,10 @@ public:
             slots[target_slot_] = GradTensor::make(target, false);
         for (int i = 0; i < np; i++)
             slots[param_slots_[i]] = GradTensor::make(params[i], true);
+        if (buffers) {
+            for (int i = 0; i < (int)buffer_slots_.size() && i < (int)buffers->size(); i++)
+                slots[buffer_slots_[i]] = GradTensor::make((*buffers)[i], false);
+        }
 
         // Forward
         for (auto& op : ops_) {
@@ -598,11 +668,76 @@ public:
                 // Matmul
                 case OpType::MATMUL: slots[op.out] = a->matmul_(slots[op.in1]); break;
                 // Reduce
-                case OpType::SUM:    slots[op.out] = a->sum_(op.iparam0, op.iparam1); break;
-                case OpType::MEAN:   slots[op.out] = a->mean_(op.iparam0, op.iparam1); break;
+                case OpType::SUM:    slots[op.out] = a->sum_(op.iparams[0], op.iparams[1]); break;
+                case OpType::MEAN:   slots[op.out] = a->mean_(op.iparams[0], op.iparams[1]); break;
                 // View
                 case OpType::TRANSPOSE:  slots[op.out] = a->transpose_(); break;
-                case OpType::TRANSPOSE2: slots[op.out] = a->transpose_(op.iparam0, op.iparam1); break;
+                case OpType::TRANSPOSE2: slots[op.out] = a->transpose_(op.iparams[0], op.iparams[1]); break;
+                case OpType::RESHAPE: {
+                    Shape s;
+                    for (int i = 0; i < 8 && op.iparams[i] != INT_MIN; i++) s.push_back(op.iparams[i]);
+                    // Handle -1 dim: infer from total size
+                    int total = a->data.size(), known = 1, neg_idx = -1;
+                    for (int i = 0; i < (int)s.size(); i++) {
+                        if (s[i] == -1) neg_idx = i;
+                        else known *= s[i];
+                    }
+                    if (neg_idx >= 0) s[neg_idx] = total / known;
+                    slots[op.out] = a->reshape_(s);
+                    break;
+                }
+                case OpType::FLATTEN: {
+                    int start = op.iparams[0];
+                    Shape orig = a->data.shape();
+                    Shape ns;
+                    for (int i = 0; i < start; i++) ns.push_back(orig[i]);
+                    int flat = 1;
+                    for (int i = start; i < (int)orig.size(); i++) flat *= orig[i];
+                    ns.push_back(flat);
+                    slots[op.out] = a->reshape_(ns);
+                    break;
+                }
+                // CNN
+                case OpType::CONV2D: {
+                    auto bias = op.in2 >= 0 ? slots[op.in2] : nullptr;
+                    slots[op.out] = a->conv2d_(slots[op.in1], bias,
+                        op.iparams[0], op.iparams[1], op.iparams[2], op.iparams[3],
+                        op.iparams[4], op.iparams[5], op.iparams[6]);
+                    break;
+                }
+                case OpType::MAX_POOL2D:
+                    slots[op.out] = a->max_pool2d_(op.iparams[0], op.iparams[1],
+                        op.iparams[2], op.iparams[3], op.iparams[4], op.iparams[5]);
+                    break;
+                case OpType::AVG_POOL2D:
+                    slots[op.out] = a->avg_pool2d_(op.iparams[0], op.iparams[1],
+                        op.iparams[2], op.iparams[3], op.iparams[4], op.iparams[5], op.iparams[6] != 0);
+                    break;
+                case OpType::BATCH_NORM2D: {
+                    // Inference-only BN: (x - mean) / sqrt(var + eps) * weight + bias
+                    auto& weight = slots[op.in2];   // gamma
+                    auto& bias = slots[op.in1];     // beta — reuse in1 for bias since input is in0
+                    // Actually: in0=input, in1=weight(gamma), in2=bias(beta), in3=rmean, iparams[0]=rvar slot
+                    auto& x = a;                    // in0
+                    auto& gamma = slots[op.in1];    // weight
+                    auto& beta = slots[op.in2];     // bias
+                    auto& rmean = slots[op.in3];    // running mean
+                    auto& rvar = slots[op.iparams[0]]; // running var
+                    float eps = op.fparam;
+                    // BN: out = gamma * (x - mean) / sqrt(var + eps) + beta
+                    // Broadcast: mean/var/gamma/beta are [C], x is [B,C,H,W]
+                    // Reshape to [1,C,1,1] for broadcast
+                    int C = gamma->data.shape()[0];
+                    Shape bc = {1, C, 1, 1};
+                    auto m = rmean->reshape_(bc);
+                    auto v = rvar->reshape_(bc);
+                    auto g = gamma->reshape_(bc);
+                    auto b = beta->reshape_(bc);
+                    auto centered = x->sub_(m);
+                    auto vstd = v->add_scalar_(eps)->sqrt_()->reciprocal_();
+                    slots[op.out] = centered->mul_(vstd)->mul_(g)->add_(b);
+                    break;
+                }
             }
         }
 

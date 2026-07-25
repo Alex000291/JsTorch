@@ -577,6 +577,82 @@ void launch_conv2d_cudnn(const float* input, const float* weight, const float* b
     cudnnDestroyConvolutionDescriptor(convDesc);
 }
 
+// ==================== cuDNN backward data + filter ====================
+
+struct ConvBwdPlan {
+    cudnnConvolutionBwdDataAlgo_t data_algo;
+    void* data_ws; size_t data_ws_size;
+    cudnnConvolutionBwdFilterAlgo_t filter_algo;
+    void* filter_ws; size_t filter_ws_size;
+};
+
+void launch_conv2d_backward_cudnn(
+    const float* input, const float* weight, const float* grad_output,
+    float* grad_input, float* grad_weight, float* grad_bias,
+    int B, int Ci, int H, int W, int Co, int kH, int kW,
+    int sH, int sW, int pH, int pW, int dH, int dW,
+    int groups, int Ho, int Wo, cudaStream_t s) {
+    
+    cudnnHandle_t handle = get_cudnn_handle();
+    cudnnSetStream(handle, s);
+    
+    cudnnTensorDescriptor_t xDesc, dyDesc;
+    cudnnFilterDescriptor_t wDesc;
+    cudnnConvolutionDescriptor_t convDesc;
+    
+    cudnnCreateTensorDescriptor(&xDesc);
+    cudnnCreateTensorDescriptor(&dyDesc);
+    cudnnCreateFilterDescriptor(&wDesc);
+    cudnnCreateConvolutionDescriptor(&convDesc);
+    
+    cudnnSetTensor4dDescriptor(xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, B, Ci, H, W);
+    cudnnSetFilter4dDescriptor(wDesc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, Co, Ci/groups, kH, kW);
+    cudnnSetConvolution2dDescriptor(convDesc, pH, pW, sH, sW, dH, dW, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
+    cudnnSetConvolutionGroupCount(convDesc, groups);
+    cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH);
+    cudnnSetTensor4dDescriptor(dyDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, B, Co, Ho, Wo);
+    
+    static std::map<ConvParams, ConvBwdPlan> bwd_cache;
+    ConvParams params{B,Ci,H,W,Co,kH,kW,sH,sW,pH,pW,dH,dW,groups};
+    auto it = bwd_cache.find(params);
+    if (it == bwd_cache.end()) {
+        ConvBwdPlan p{};
+        int count;
+        cudnnConvolutionBwdDataAlgoPerf_t dperf;
+        cudnnGetConvolutionBackwardDataAlgorithm_v7(handle, wDesc, dyDesc, convDesc, xDesc, 1, &count, &dperf);
+        p.data_algo = dperf.algo; p.data_ws = nullptr; p.data_ws_size = 0;
+        cudnnGetConvolutionBackwardDataWorkspaceSize(handle, wDesc, dyDesc, convDesc, xDesc, p.data_algo, &p.data_ws_size);
+        if (p.data_ws_size > 0) cudaMalloc(&p.data_ws, p.data_ws_size);
+        cudnnConvolutionBwdFilterAlgoPerf_t fperf;
+        cudnnGetConvolutionBackwardFilterAlgorithm_v7(handle, xDesc, dyDesc, convDesc, wDesc, 1, &count, &fperf);
+        p.filter_algo = fperf.algo; p.filter_ws = nullptr; p.filter_ws_size = 0;
+        cudnnGetConvolutionBackwardFilterWorkspaceSize(handle, xDesc, dyDesc, convDesc, wDesc, p.filter_algo, &p.filter_ws_size);
+        if (p.filter_ws_size > 0) cudaMalloc(&p.filter_ws, p.filter_ws_size);
+        it = bwd_cache.emplace(params, p).first;
+    }
+    const auto& plan = it->second;
+    float alpha = 1.0f, beta = 0.0f;
+    
+    if (grad_input)
+        cudnnConvolutionBackwardData(handle, &alpha, wDesc, weight, dyDesc, grad_output,
+            convDesc, plan.data_algo, plan.data_ws, plan.data_ws_size, &beta, xDesc, grad_input);
+    if (grad_weight)
+        cudnnConvolutionBackwardFilter(handle, &alpha, xDesc, input, dyDesc, grad_output,
+            convDesc, plan.filter_algo, plan.filter_ws, plan.filter_ws_size, &beta, wDesc, grad_weight);
+    if (grad_bias) {
+        cudnnTensorDescriptor_t dbDesc;
+        cudnnCreateTensorDescriptor(&dbDesc);
+        cudnnSetTensor4dDescriptor(dbDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, Co, 1, 1);
+        cudnnConvolutionBackwardBias(handle, &alpha, dyDesc, grad_output, &beta, dbDesc, grad_bias);
+        cudnnDestroyTensorDescriptor(dbDesc);
+    }
+    
+    cudnnDestroyTensorDescriptor(xDesc);
+    cudnnDestroyTensorDescriptor(dyDesc);
+    cudnnDestroyFilterDescriptor(wDesc);
+    cudnnDestroyConvolutionDescriptor(convDesc);
+}
+
 }
 
 }

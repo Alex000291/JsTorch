@@ -91,6 +91,9 @@ extern "C" {
         int, int, int, int, int, int, int, int, int, int, int, int, bool, cudaStream_t);
     void launch_conv1d_backward_weight(const float*, const float*, float*, float*,
         int, int, int, int, int, int, int, int, int, int, cudaStream_t);
+    void launch_conv2d_backward_cudnn(const float*, const float*, const float*,
+        float*, float*, float*,
+        int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, cudaStream_t);
     void launch_conv2d_backward_weight(const float*, const float*, float*, float*,
         int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, cudaStream_t);
     void launch_conv_transpose1d_backward_weight(const float*, const float*, float*, float*,
@@ -837,6 +840,19 @@ Tensor Tensor::conv2d_backward_weight(const Tensor& input, const Tensor& grad_ou
         B, Ci, H, W, Co, kH, kW, sH, sW, pH, pW, dH, dW, groups, Ho, Wo, 0);
     cudaFree(col_buf);
     return gw;
+}
+
+void Tensor::conv2d_backward_cudnn(const Tensor& input, const Tensor& weight, const Tensor& grad_output,
+                                    Tensor& grad_input, Tensor& grad_weight, Tensor* grad_bias,
+                                    int sH, int sW, int pH, int pW, int dH, int dW, int groups) {
+    Tensor ci = input.contiguous(), cw = weight.contiguous(), cg = grad_output.contiguous();
+    int B = input.shape()[0], Ci = input.shape()[1], H = input.shape()[2], W = input.shape()[3];
+    int Co = weight.shape()[0], kH = weight.shape()[2], kW = weight.shape()[3];
+    int Ho = grad_output.shape()[2], Wo = grad_output.shape()[3];
+    launch_conv2d_backward_cudnn(ci.data<float>(), cw.data<float>(), cg.data<float>(),
+        grad_input.data<float>(), grad_weight.data<float>(),
+        grad_bias ? grad_bias->data<float>() : nullptr,
+        B, Ci, H, W, Co, kH, kW, sH, sW, pH, pW, dH, dW, groups, Ho, Wo, 0);
 }
 
 // ConvTranspose1d backward weight

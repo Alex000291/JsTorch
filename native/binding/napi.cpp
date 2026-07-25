@@ -1117,6 +1117,15 @@ public:
             InstanceMethod("mean", &CompiledGraphWrap::Mean_),
             // View
             InstanceMethod("transpose", &CompiledGraphWrap::Transpose_),
+            InstanceMethod("reshape", &CompiledGraphWrap::Reshape_),
+            InstanceMethod("flatten", &CompiledGraphWrap::Flatten_),
+            // CNN
+            InstanceMethod("conv2d", &CompiledGraphWrap::Conv2d_),
+            InstanceMethod("max_pool2d", &CompiledGraphWrap::MaxPool2d_),
+            InstanceMethod("avg_pool2d", &CompiledGraphWrap::AvgPool2d_),
+            InstanceMethod("batch_norm2d", &CompiledGraphWrap::BatchNorm2d_),
+            // Buffer
+            InstanceMethod("buffer", &CompiledGraphWrap::Buffer),
             // Run
             InstanceMethod("run", &CompiledGraphWrap::Run),
         });
@@ -1201,6 +1210,74 @@ public:
         return Napi::Number::New(info.Env(), graph_.op1(OpType::TRANSPOSE, a));
     }
 
+    // Reshape
+    Napi::Value Reshape_(const Napi::CallbackInfo& info) {
+        int a = info[0].As<Napi::Number>().Int32Value();
+        Napi::Array shape = info[1].As<Napi::Array>();
+        std::vector<int> s;
+        for (uint32_t i = 0; i < shape.Length(); i++)
+            s.push_back(shape.Get(i).As<Napi::Number>().Int32Value());
+        return Napi::Number::New(info.Env(), graph_.reshape(a, s));
+    }
+
+    Napi::Value Flatten_(const Napi::CallbackInfo& info) {
+        int a = info[0].As<Napi::Number>().Int32Value();
+        int start_dim = info.Length() > 1 ? info[1].As<Napi::Number>().Int32Value() : 1;
+        return Napi::Number::New(info.Env(), graph_.flatten(a, start_dim));
+    }
+
+    // CNN ops
+    Napi::Value Conv2d_(const Napi::CallbackInfo& info) {
+        int input = info[0].As<Napi::Number>().Int32Value();
+        int weight = info[1].As<Napi::Number>().Int32Value();
+        int bias = info[2].IsNull() || info[2].IsUndefined() ? -1 : info[2].As<Napi::Number>().Int32Value();
+        int sH = info[3].As<Napi::Number>().Int32Value();
+        int sW = info[4].As<Napi::Number>().Int32Value();
+        int pH = info[5].As<Napi::Number>().Int32Value();
+        int pW = info[6].As<Napi::Number>().Int32Value();
+        int dH = info[7].As<Napi::Number>().Int32Value();
+        int dW = info[8].As<Napi::Number>().Int32Value();
+        int groups = info[9].As<Napi::Number>().Int32Value();
+        return Napi::Number::New(info.Env(), graph_.conv2d(input, weight, bias, sH, sW, pH, pW, dH, dW, groups));
+    }
+
+    Napi::Value MaxPool2d_(const Napi::CallbackInfo& info) {
+        int input = info[0].As<Napi::Number>().Int32Value();
+        int kH = info[1].As<Napi::Number>().Int32Value();
+        int kW = info[2].As<Napi::Number>().Int32Value();
+        int sH = info[3].As<Napi::Number>().Int32Value();
+        int sW = info[4].As<Napi::Number>().Int32Value();
+        int pH = info[5].As<Napi::Number>().Int32Value();
+        int pW = info[6].As<Napi::Number>().Int32Value();
+        return Napi::Number::New(info.Env(), graph_.max_pool2d(input, kH, kW, sH, sW, pH, pW));
+    }
+
+    Napi::Value AvgPool2d_(const Napi::CallbackInfo& info) {
+        int input = info[0].As<Napi::Number>().Int32Value();
+        int kH = info[1].As<Napi::Number>().Int32Value();
+        int kW = info[2].As<Napi::Number>().Int32Value();
+        int sH = info[3].As<Napi::Number>().Int32Value();
+        int sW = info[4].As<Napi::Number>().Int32Value();
+        int pH = info[5].As<Napi::Number>().Int32Value();
+        int pW = info[6].As<Napi::Number>().Int32Value();
+        bool cip = info.Length() > 7 ? info[7].As<Napi::Boolean>().Value() : true;
+        return Napi::Number::New(info.Env(), graph_.avg_pool2d(input, kH, kW, sH, sW, pH, pW, cip));
+    }
+
+    Napi::Value BatchNorm2d_(const Napi::CallbackInfo& info) {
+        int input = info[0].As<Napi::Number>().Int32Value();
+        int weight = info[1].As<Napi::Number>().Int32Value();
+        int bias = info[2].As<Napi::Number>().Int32Value();
+        int rmean = info[3].As<Napi::Number>().Int32Value();
+        int rvar = info[4].As<Napi::Number>().Int32Value();
+        float eps = info.Length() > 5 ? info[5].As<Napi::Number>().FloatValue() : 1e-5f;
+        return Napi::Number::New(info.Env(), graph_.batch_norm2d(input, weight, bias, rmean, rvar, eps));
+    }
+
+    Napi::Value Buffer(const Napi::CallbackInfo& info) {
+        return Napi::Number::New(info.Env(), graph_.buffer());
+    }
+
     // Run: forward + backward + Adam, all in C++
     Napi::Value Run(const Napi::CallbackInfo& info) {
         Napi::Env env = info.Env();
@@ -1230,10 +1307,19 @@ public:
         float bc2 = info[10].As<Napi::Number>().FloatValue();
         float wd  = info[11].As<Napi::Number>().FloatValue();
 
-        graph_.run(inp->tensor_, tgt->tensor_, params, ms, vs, lr, b1, b2, eps, bc1, bc2, wd);
+        // Optional buffers array (arg 12)
+        std::vector<Tensor> bufs;
+        std::vector<Tensor>* bufs_ptr = nullptr;
+        if (info.Length() > 12 && info[12].IsArray()) {
+            Napi::Array b_arr = info[12].As<Napi::Array>();
+            uint32_t nb = b_arr.Length();
+            bufs.reserve(nb);
+            for (uint32_t i = 0; i < nb; i++)
+                bufs.push_back(Napi::ObjectWrap<TensorWrap>::Unwrap(b_arr.Get(i).As<Napi::Object>())->tensor_);
+            bufs_ptr = &bufs;
+        }
 
-        // Write back updated params/m/v (adam modifies in-place via pointers)
-        // The Tensor objects are shared via shared_ptr, so the JS-side Tensors are already updated.
+        graph_.run(inp->tensor_, tgt->tensor_, params, ms, vs, lr, b1, b2, eps, bc1, bc2, wd, bufs_ptr);
 
         return env.Undefined();
     }

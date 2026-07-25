@@ -135,6 +135,9 @@ public:
     Tensor avg_pool2d(int kH, int kW, int sH, int sW, int pH, int pW, bool count_include_pad = true) const;
     std::pair<Tensor, Tensor> max_pool2d(int kH, int kW, int sH, int sW, int pH, int pW) const;
     static Tensor maxpool2d_backward(const Tensor& grad, const Tensor& indices, int B, int C, int H, int W);
+    static void conv2d_backward_cudnn(const Tensor& input, const Tensor& weight, const Tensor& grad_output,
+                                       Tensor& grad_input, Tensor& grad_weight, Tensor* grad_bias,
+                                       int sH, int sW, int pH, int pW, int dH, int dW, int groups);
     
     Tensor interpolate(int target_size, int mode, bool align_corners = false) const;
     
