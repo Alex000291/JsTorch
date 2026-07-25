@@ -1,6 +1,6 @@
 {
   "name": "@alex000291/jstorch",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "A JavaScript version of PyTorch with CUDA acceleration",
   "homepage": "https://github.com/Alex000291/JsTorch#readme",
   "types": "src/index.d.ts",
