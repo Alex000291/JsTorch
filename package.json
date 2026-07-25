@@ -21,12 +21,13 @@
   "scripts": {
     "build": "node Makefile.js",
     "test": "node src/test1.js",
+    "postinstall": "node scripts/postinstall.js",
     "prepublishOnly": "npm run build"
   },
   "files": [
     "src/",
+    "scripts/postinstall.js",
     "build/win/jstorch.node",
-    "build/win/dlls/",
     "README.md",
     "LICENSE"
   ],
