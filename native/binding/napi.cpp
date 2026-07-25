@@ -1,8 +1,15 @@
 #include <napi.h>
 #include "../core/tensor.hpp"
+#include "../core/autograd.hpp"
 #include <vector>
 
 using namespace jstorch;
+
+// Store both constructors
+struct CtorRefs {
+    Napi::FunctionReference tensor_ctor;
+    Napi::FunctionReference grad_ctor;
+};
 
 // ==================== Helpers ====================
 Napi::Value buildNestedArray(Napi::Env env, const std::vector<float>& data, const Shape& shape, int dim, int offset) {
@@ -55,8 +62,8 @@ public: // data_ needs friend access from static methods
 
     // Helper: wrap a C++ Tensor into a JS TensorWrap
     static Napi::Object Wrap(Napi::Env env, Tensor t) {
-        auto* ctor = env.GetInstanceData<Napi::FunctionReference>();
-        Napi::Object obj = ctor->New({});
+        auto* refs = env.GetInstanceData<CtorRefs>();
+        Napi::Object obj = refs->tensor_ctor.New({});
         Napi::ObjectWrap<TensorWrap>::Unwrap(obj)->tensor_ = std::move(t);
         return obj;
     }
@@ -165,9 +172,12 @@ public: // data_ needs friend access from static methods
             StaticMethod("adamStep", &TensorWrap::AdamStep),
         });
         
-        auto* ctor = new Napi::FunctionReference();
-        *ctor = Napi::Persistent(func);
-        env.SetInstanceData(ctor);
+        auto* refs = env.GetInstanceData<CtorRefs>();
+        if (!refs) {
+            refs = new CtorRefs();
+            env.SetInstanceData(refs);
+        }
+        refs->tensor_ctor = Napi::Persistent(func);
         exports.Set("Tensor", func);
         return exports;
     }
@@ -620,8 +630,582 @@ public: // data_ needs friend access from static methods
     }
 };
 
+// ==================== GradTensorWrap ====================
+class GradTensorWrap : public Napi::ObjectWrap<GradTensorWrap> {
+public:
+    GradPtr gt_;
+
+    static Napi::Object Wrap(Napi::Env env, GradPtr g) {
+        auto* refs = env.GetInstanceData<CtorRefs>();
+        Napi::Object obj = refs->grad_ctor.New({});
+        Napi::ObjectWrap<GradTensorWrap>::Unwrap(obj)->gt_ = std::move(g);
+        return obj;
+    }
+
+    // Extract GradPtr from JS value
+    static GradPtr Extract(Napi::Value v) {
+        return Napi::ObjectWrap<GradTensorWrap>::Unwrap(v.As<Napi::Object>())->gt_;
+    }
+
+    static Napi::Object Init(Napi::Env env, Napi::Object exports) {
+        Napi::Function func = DefineClass(env, "GradTensor", {
+            InstanceAccessor("shape", &GradTensorWrap::GetShape, nullptr),
+            InstanceAccessor("ndim", &GradTensorWrap::GetNdim, nullptr),
+            InstanceAccessor("requires_grad", &GradTensorWrap::GetRequiresGrad, &GradTensorWrap::SetRequiresGrad),
+
+            InstanceMethod("toArray", &GradTensorWrap::ToArray),
+            InstanceMethod("backward", &GradTensorWrap::Backward),
+            InstanceMethod("getGrad", &GradTensorWrap::GetGrad),
+            InstanceMethod("setGrad", &GradTensorWrap::SetGrad),
+            InstanceMethod("clearGrad", &GradTensorWrap::ClearGrad),
+            InstanceMethod("detach", &GradTensorWrap::Detach),
+            InstanceMethod("getData", &GradTensorWrap::GetData),
+
+            // View ops
+            InstanceMethod("reshape", &GradTensorWrap::Reshape),
+            InstanceMethod("transpose", &GradTensorWrap::Transpose),
+            InstanceMethod("squeeze", &GradTensorWrap::Squeeze),
+            InstanceMethod("unsqueeze", &GradTensorWrap::Unsqueeze),
+            InstanceMethod("clone", &GradTensorWrap::Clone),
+            InstanceMethod("contiguous", &GradTensorWrap::Contiguous),
+            InstanceMethod("flatten", &GradTensorWrap::Flatten),
+            InstanceMethod("slice", &GradTensorWrap::Slice),
+
+            // Unary ops
+            InstanceMethod("exp", &GradTensorWrap::Exp),
+            InstanceMethod("log", &GradTensorWrap::Log),
+            InstanceMethod("sqrt", &GradTensorWrap::Sqrt),
+            InstanceMethod("square", &GradTensorWrap::Square),
+            InstanceMethod("neg", &GradTensorWrap::Neg),
+            InstanceMethod("abs", &GradTensorWrap::Abs),
+            InstanceMethod("sin", &GradTensorWrap::Sin),
+            InstanceMethod("cos", &GradTensorWrap::Cos),
+            InstanceMethod("sigmoid", &GradTensorWrap::Sigmoid),
+            InstanceMethod("tanh", &GradTensorWrap::Tanh),
+            InstanceMethod("relu", &GradTensorWrap::Relu),
+            InstanceMethod("silu", &GradTensorWrap::Silu),
+            InstanceMethod("gelu", &GradTensorWrap::Gelu),
+            InstanceMethod("softplus", &GradTensorWrap::Softplus),
+            InstanceMethod("reciprocal", &GradTensorWrap::Reciprocal),
+            InstanceMethod("sign", &GradTensorWrap::Sign),
+            InstanceMethod("log1p", &GradTensorWrap::Log1p),
+            InstanceMethod("pow_scalar", &GradTensorWrap::PowScalar),
+            InstanceMethod("mul_scalar", &GradTensorWrap::MulScalar),
+            InstanceMethod("add_scalar", &GradTensorWrap::AddScalar),
+
+            // Binary ops
+            InstanceMethod("add", &GradTensorWrap::Add),
+            InstanceMethod("sub", &GradTensorWrap::Sub),
+            InstanceMethod("mul", &GradTensorWrap::Mul),
+            InstanceMethod("div", &GradTensorWrap::Div),
+            InstanceMethod("pow", &GradTensorWrap::Pow),
+            InstanceMethod("gt", &GradTensorWrap::Gt),
+            InstanceMethod("lt", &GradTensorWrap::Lt),
+            InstanceMethod("ge", &GradTensorWrap::Ge),
+            InstanceMethod("le", &GradTensorWrap::Le),
+            InstanceMethod("eq", &GradTensorWrap::Eq),
+            InstanceMethod("ne", &GradTensorWrap::Ne),
+
+            // Matmul
+            InstanceMethod("matmul", &GradTensorWrap::Matmul),
+
+            // Reduce
+            InstanceMethod("sum", &GradTensorWrap::Sum),
+            InstanceMethod("mean", &GradTensorWrap::Mean),
+
+            // Conv/Pool
+            InstanceMethod("conv2d", &GradTensorWrap::Conv2d),
+            InstanceMethod("avg_pool2d", &GradTensorWrap::AvgPool2d),
+
+            // Static
+            StaticMethod("randn", &GradTensorWrap::Randn),
+            StaticMethod("zeros", &GradTensorWrap::Zeros),
+            StaticMethod("ones", &GradTensorWrap::Ones),
+            StaticMethod("full", &GradTensorWrap::FullS),
+            StaticMethod("fromBuffer", &GradTensorWrap::FromBuffer),
+            StaticMethod("fromTensor", &GradTensorWrap::FromTensor),
+            StaticMethod("adamStep", &GradTensorWrap::AdamStep),
+            StaticMethod("adamStepMulti", &GradTensorWrap::AdamStepMulti),
+        });
+
+        auto* refs = env.GetInstanceData<CtorRefs>();
+        refs->grad_ctor = Napi::Persistent(func);
+        exports.Set("GradTensor", func);
+        return exports;
+    }
+
+    GradTensorWrap(const Napi::CallbackInfo& info)
+        : Napi::ObjectWrap<GradTensorWrap>(info) {
+        gt_ = GradTensor::make(Tensor({1}));
+    }
+
+    // ==================== Accessors ====================
+    Napi::Value GetShape(const Napi::CallbackInfo& info) {
+        auto& s = gt_->shape();
+        Napi::Array arr = Napi::Array::New(info.Env(), s.size());
+        for (size_t i = 0; i < s.size(); i++) arr[i] = Napi::Number::New(info.Env(), s[i]);
+        return arr;
+    }
+    Napi::Value GetNdim(const Napi::CallbackInfo& info) {
+        return Napi::Number::New(info.Env(), gt_->ndim());
+    }
+    Napi::Value GetRequiresGrad(const Napi::CallbackInfo& info) {
+        return Napi::Boolean::New(info.Env(), gt_->requires_grad);
+    }
+    void SetRequiresGrad(const Napi::CallbackInfo& info, const Napi::Value& val) {
+        gt_->requires_grad = val.As<Napi::Boolean>().Value();
+    }
+    Napi::Value ToArray(const Napi::CallbackInfo& info) {
+        auto data = gt_->data.to_array();
+        return buildNestedArray(info.Env(), data, gt_->shape(), 0, 0);
+    }
+    Napi::Value GetData(const Napi::CallbackInfo& info) {
+        return TensorWrap::Wrap(info.Env(), gt_->data);
+    }
+    Napi::Value Detach(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), GradTensor::make(gt_->data, false));
+    }
+
+    // ==================== Backward ====================
+    Napi::Value Backward(const Napi::CallbackInfo& info) {
+        Tensor upstream = (info.Length() > 0 && !info[0].IsUndefined())
+            ? Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>())->tensor_
+            : Tensor::full(gt_->shape(), 1.0f);
+        GradTensor::backward(gt_, std::move(upstream));
+        return info.Env().Undefined();
+    }
+    Napi::Value GetGrad(const Napi::CallbackInfo& info) {
+        if (!gt_->has_grad) return info.Env().Null();
+        return TensorWrap::Wrap(info.Env(), *gt_->grad_);
+    }
+    void SetGrad(const Napi::CallbackInfo& info) {
+        if (info[0].IsNull() || info[0].IsUndefined()) {
+            gt_->has_grad = false;
+        } else {
+            gt_->grad_ = std::make_shared<Tensor>(
+                Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>())->tensor_);
+            gt_->has_grad = true;
+        }
+    }
+    Napi::Value ClearGrad(const Napi::CallbackInfo& info) {
+        gt_->has_grad = false;
+        return info.Env().Undefined();
+    }
+
+    // ==================== View ops ====================
+    Napi::Value Reshape(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), gt_->reshape_(parseShape(info, 0)));
+    }
+    Napi::Value Transpose(const Napi::CallbackInfo& info) {
+        if (info.Length() >= 2)
+            return Wrap(info.Env(), gt_->transpose_(
+                info[0].As<Napi::Number>().Int32Value(),
+                info[1].As<Napi::Number>().Int32Value()));
+        return Wrap(info.Env(), gt_->transpose_());
+    }
+    Napi::Value Squeeze(const Napi::CallbackInfo& info) {
+        // Squeeze is just reshape
+        int axis = info.Length() > 0 ? info[0].As<Napi::Number>().Int32Value() : -1;
+        Tensor out = gt_->data.squeeze(axis);
+        if (!gt_->requires_grad) return Wrap(info.Env(), GradTensor::make(std::move(out)));
+        Shape orig = gt_->shape();
+        return Wrap(info.Env(), GradTensor::make_with_grad(std::move(out),
+            [orig](const Tensor& g) { return std::vector<Tensor>{g.reshape(orig)}; },
+            {gt_}));
+    }
+    Napi::Value Unsqueeze(const Napi::CallbackInfo& info) {
+        int dim = info[0].As<Napi::Number>().Int32Value();
+        Tensor out = gt_->data.unsqueeze(dim);
+        if (!gt_->requires_grad) return Wrap(info.Env(), GradTensor::make(std::move(out)));
+        Shape orig = gt_->shape();
+        return Wrap(info.Env(), GradTensor::make_with_grad(std::move(out),
+            [orig](const Tensor& g) { return std::vector<Tensor>{g.reshape(orig)}; },
+            {gt_}));
+    }
+    Napi::Value Clone(const Napi::CallbackInfo& info) {
+        Tensor out = gt_->data.clone();
+        if (!gt_->requires_grad) return Wrap(info.Env(), GradTensor::make(std::move(out)));
+        return Wrap(info.Env(), GradTensor::make_with_grad(std::move(out),
+            [](const Tensor& g) { return std::vector<Tensor>{g.clone()}; },
+            {gt_}));
+    }
+    Napi::Value Contiguous(const Napi::CallbackInfo& info) {
+        Tensor out = gt_->data.contiguous();
+        if (!gt_->requires_grad) return Wrap(info.Env(), GradTensor::make(std::move(out)));
+        return Wrap(info.Env(), GradTensor::make_with_grad(std::move(out),
+            [](const Tensor& g) { return std::vector<Tensor>{g}; },
+            {gt_}));
+    }
+    Napi::Value Flatten(const Napi::CallbackInfo& info) {
+        int s = info[0].As<Napi::Number>().Int32Value();
+        int e = info.Length() > 1 ? info[1].As<Napi::Number>().Int32Value() : -1;
+        Tensor out = gt_->data.flatten(s, e);
+        if (!gt_->requires_grad) return Wrap(info.Env(), GradTensor::make(std::move(out)));
+        Shape orig = gt_->shape();
+        return Wrap(info.Env(), GradTensor::make_with_grad(std::move(out),
+            [orig](const Tensor& g) { return std::vector<Tensor>{g.reshape(orig)}; },
+            {gt_}));
+    }
+    Napi::Value Slice(const Napi::CallbackInfo& info) {
+        int dim = info[0].As<Napi::Number>().Int32Value();
+        int start = info[1].As<Napi::Number>().Int32Value();
+        int end = info[2].As<Napi::Number>().Int32Value();
+        Tensor out = gt_->data.slice(dim, start, end);
+        if (!gt_->requires_grad) return Wrap(info.Env(), GradTensor::make(std::move(out)));
+        Shape orig = gt_->shape();
+        return Wrap(info.Env(), GradTensor::make_with_grad(std::move(out),
+            [orig, dim, start, end](const Tensor& g) {
+                // Build zero tensor, cat [zeros_before, g, zeros_after]
+                std::vector<Tensor> parts;
+                if (start > 0) {
+                    Shape bs = g.shape(); bs[dim] = start;
+                    parts.push_back(Tensor::full(bs, 0.0f));
+                }
+                parts.push_back(g);
+                int after = orig[dim] - end;
+                if (after > 0) {
+                    Shape as = g.shape(); as[dim] = after;
+                    parts.push_back(Tensor::full(as, 0.0f));
+                }
+                return std::vector<Tensor>{Tensor::cat(parts, dim)};
+            }, {gt_}));
+    }
+
+    // ==================== Unary ops (delegate to autograd.hpp) ====================
+    #define GRAD_UNARY(JsName, CppMethod) \
+    Napi::Value JsName(const Napi::CallbackInfo& info) { return Wrap(info.Env(), gt_->CppMethod()); }
+
+    GRAD_UNARY(Exp, exp_)      GRAD_UNARY(Log, log_)      GRAD_UNARY(Sqrt, sqrt_)
+    GRAD_UNARY(Square, square_) GRAD_UNARY(Neg, neg_)      GRAD_UNARY(Abs, abs_)
+    GRAD_UNARY(Sin, sin_)      GRAD_UNARY(Cos, cos_)      GRAD_UNARY(Sigmoid, sigmoid_)
+    GRAD_UNARY(Tanh, tanh_)    GRAD_UNARY(Relu, relu_)    GRAD_UNARY(Silu, silu_)
+    GRAD_UNARY(Gelu, gelu_)    GRAD_UNARY(Softplus, softplus_)
+    GRAD_UNARY(Reciprocal, reciprocal_) GRAD_UNARY(Sign, sign_) GRAD_UNARY(Log1p, log1p_)
+
+    Napi::Value PowScalar(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), gt_->pow_scalar_(info[0].As<Napi::Number>().FloatValue()));
+    }
+    Napi::Value MulScalar(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), gt_->mul_scalar_(info[0].As<Napi::Number>().FloatValue()));
+    }
+    Napi::Value AddScalar(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), gt_->add_scalar_(info[0].As<Napi::Number>().FloatValue()));
+    }
+
+    // ==================== Binary ops ====================
+    // Scalars: wrap as single-element GradTensor or use scalar ops
+    Napi::Value Add(const Napi::CallbackInfo& info) {
+        if (info[0].IsNumber())
+            return Wrap(info.Env(), gt_->add_scalar_(info[0].As<Napi::Number>().FloatValue()));
+        return Wrap(info.Env(), gt_->add_(Extract(info[0])));
+    }
+    Napi::Value Sub(const Napi::CallbackInfo& info) {
+        if (info[0].IsNumber())
+            return Wrap(info.Env(), gt_->add_scalar_(-info[0].As<Napi::Number>().FloatValue()));
+        return Wrap(info.Env(), gt_->sub_(Extract(info[0])));
+    }
+    Napi::Value Mul(const Napi::CallbackInfo& info) {
+        if (info[0].IsNumber())
+            return Wrap(info.Env(), gt_->mul_scalar_(info[0].As<Napi::Number>().FloatValue()));
+        return Wrap(info.Env(), gt_->mul_(Extract(info[0])));
+    }
+    Napi::Value Div(const Napi::CallbackInfo& info) {
+        if (info[0].IsNumber())
+            return Wrap(info.Env(), gt_->mul_scalar_(1.0f / info[0].As<Napi::Number>().FloatValue()));
+        return Wrap(info.Env(), gt_->div_(Extract(info[0])));
+    }
+    Napi::Value Pow(const Napi::CallbackInfo& info) {
+        if (info[0].IsNumber())
+            return Wrap(info.Env(), gt_->pow_scalar_(info[0].As<Napi::Number>().FloatValue()));
+        return Wrap(info.Env(), gt_->pow_(Extract(info[0])));
+    }
+    Napi::Value Gt(const Napi::CallbackInfo& info) { return Wrap(info.Env(), gt_->gt_(Extract(info[0]))); }
+    Napi::Value Lt(const Napi::CallbackInfo& info) { return Wrap(info.Env(), gt_->lt_(Extract(info[0]))); }
+    Napi::Value Ge(const Napi::CallbackInfo& info) { return Wrap(info.Env(), gt_->ge_(Extract(info[0]))); }
+    Napi::Value Le(const Napi::CallbackInfo& info) { return Wrap(info.Env(), gt_->le_(Extract(info[0]))); }
+    Napi::Value Eq(const Napi::CallbackInfo& info) { return Wrap(info.Env(), gt_->eq_(Extract(info[0]))); }
+    Napi::Value Ne(const Napi::CallbackInfo& info) { return Wrap(info.Env(), gt_->ne_(Extract(info[0]))); }
+
+    // ==================== Matmul ====================
+    Napi::Value Matmul(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), gt_->matmul_(Extract(info[0])));
+    }
+
+    // ==================== Reduce ====================
+    Napi::Value Sum(const Napi::CallbackInfo& info) {
+        int dim = info.Length() > 0 ? info[0].As<Napi::Number>().Int32Value() : -1;
+        bool keepdim = info.Length() > 1 ? info[1].As<Napi::Boolean>().Value() : false;
+        return Wrap(info.Env(), gt_->sum_(dim, keepdim));
+    }
+    Napi::Value Mean(const Napi::CallbackInfo& info) {
+        int dim = info.Length() > 0 ? info[0].As<Napi::Number>().Int32Value() : -1;
+        bool keepdim = info.Length() > 1 ? info[1].As<Napi::Boolean>().Value() : false;
+        return Wrap(info.Env(), gt_->mean_(dim, keepdim));
+    }
+
+    // ==================== Conv/Pool ====================
+    Napi::Value Conv2d(const Napi::CallbackInfo& info) {
+        GradPtr w = Extract(info[0]);
+        GradPtr b = nullptr;
+        if (!info[1].IsNull() && !info[1].IsUndefined())
+            b = Extract(info[1]);
+        int sH = info[2].As<Napi::Number>().Int32Value();
+        int sW = info[3].As<Napi::Number>().Int32Value();
+        int pH = info[4].As<Napi::Number>().Int32Value();
+        int pW = info[5].As<Napi::Number>().Int32Value();
+        int dH = info[6].As<Napi::Number>().Int32Value();
+        int dW = info[7].As<Napi::Number>().Int32Value();
+        int groups = info[8].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), gt_->conv2d_(w, b, sH, sW, pH, pW, dH, dW, groups));
+    }
+    Napi::Value AvgPool2d(const Napi::CallbackInfo& info) {
+        int kH = info[0].As<Napi::Number>().Int32Value();
+        int kW = info[1].As<Napi::Number>().Int32Value();
+        int sH = info[2].As<Napi::Number>().Int32Value();
+        int sW = info[3].As<Napi::Number>().Int32Value();
+        int pH = info[4].As<Napi::Number>().Int32Value();
+        int pW = info[5].As<Napi::Number>().Int32Value();
+        bool cip = info.Length() > 6 ? info[6].As<Napi::Boolean>().Value() : true;
+        return Wrap(info.Env(), gt_->avg_pool2d_(kH, kW, sH, sW, pH, pW, cip));
+    }
+
+    // ==================== Static factories ====================
+    static Napi::Value Randn(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), GradTensor::make(Tensor::randn(parseShape(info, 0))));
+    }
+    static Napi::Value Zeros(const Napi::CallbackInfo& info) {
+        Shape s = parseShape(info, 0);
+        return Wrap(info.Env(), GradTensor::make(Tensor::full(s, 0.0f)));
+    }
+    static Napi::Value Ones(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), GradTensor::make(Tensor::full(parseShape(info, 0), 1.0f)));
+    }
+    static Napi::Value FullS(const Napi::CallbackInfo& info) {
+        Shape s = parseShape(info, 0);
+        float v = info[1].As<Napi::Number>().FloatValue();
+        return Wrap(info.Env(), GradTensor::make(Tensor::full(s, v)));
+    }
+    static Napi::Value FromBuffer(const Napi::CallbackInfo& info) {
+        Napi::Float32Array f32 = info[0].As<Napi::Float32Array>();
+        Shape shape = parseShape(info, 1);
+        return Wrap(info.Env(), GradTensor::make(
+            Tensor::from_buffer(f32.Data(), (int)f32.ElementLength(), shape)));
+    }
+    static Napi::Value FromTensor(const Napi::CallbackInfo& info) {
+        auto* tw = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        bool rg = info.Length() > 1 ? info[1].As<Napi::Boolean>().Value() : false;
+        return Wrap(info.Env(), GradTensor::make(tw->tensor_, rg));
+    }
+
+    // ==================== Adam (single + multi) ====================
+    static Napi::Value AdamStep(const Napi::CallbackInfo& info) {
+        auto p = Extract(info[0]), g = Extract(info[1]), m = Extract(info[2]), v = Extract(info[3]);
+        float lr = info[4].As<Napi::Number>().FloatValue();
+        float b1 = info[5].As<Napi::Number>().FloatValue();
+        float b2 = info[6].As<Napi::Number>().FloatValue();
+        float eps = info[7].As<Napi::Number>().FloatValue();
+        float bc1 = info[8].As<Napi::Number>().FloatValue();
+        float bc2 = info[9].As<Napi::Number>().FloatValue();
+        float wd = info[10].As<Napi::Number>().FloatValue();
+        Tensor::adam_step(p->data, g->data, m->data, v->data, lr, b1, b2, eps, bc1, bc2, wd);
+        return info.Env().Undefined();
+    }
+
+    // Multi-tensor Adam: process all parameters in a batch
+    static Napi::Value AdamStepMulti(const Napi::CallbackInfo& info) {
+        Napi::Array params = info[0].As<Napi::Array>();
+        Napi::Array grads = info[1].As<Napi::Array>();
+        Napi::Array ms = info[2].As<Napi::Array>();
+        Napi::Array vs = info[3].As<Napi::Array>();
+        float lr = info[4].As<Napi::Number>().FloatValue();
+        float b1 = info[5].As<Napi::Number>().FloatValue();
+        float b2 = info[6].As<Napi::Number>().FloatValue();
+        float eps = info[7].As<Napi::Number>().FloatValue();
+        float bc1 = info[8].As<Napi::Number>().FloatValue();
+        float bc2 = info[9].As<Napi::Number>().FloatValue();
+        float wd = info[10].As<Napi::Number>().FloatValue();
+        uint32_t n = params.Length();
+        for (uint32_t i = 0; i < n; i++) {
+            auto p = Extract(params.Get(i));
+            auto g = Extract(grads.Get(i));
+            auto m = Extract(ms.Get(i));
+            auto v = Extract(vs.Get(i));
+            Tensor::adam_step(p->data, g->data, m->data, v->data, lr, b1, b2, eps, bc1, bc2, wd);
+        }
+        return info.Env().Undefined();
+    }
+};
+
+// ==================== CompiledGraphWrap ====================
+class CompiledGraphWrap : public Napi::ObjectWrap<CompiledGraphWrap> {
+    CompiledGraph graph_;
+
+public:
+    static Napi::Object Init(Napi::Env env, Napi::Object exports) {
+        Napi::Function func = DefineClass(env, "CompiledGraph", {
+            InstanceMethod("input", &CompiledGraphWrap::Input),
+            InstanceMethod("target", &CompiledGraphWrap::Target),
+            InstanceMethod("param", &CompiledGraphWrap::Param),
+            InstanceMethod("setOutput", &CompiledGraphWrap::SetOutput),
+            // Unary
+            InstanceMethod("relu", &CompiledGraphWrap::Relu),
+            InstanceMethod("exp", &CompiledGraphWrap::Exp),
+            InstanceMethod("log", &CompiledGraphWrap::Log),
+            InstanceMethod("sqrt", &CompiledGraphWrap::Sqrt),
+            InstanceMethod("square", &CompiledGraphWrap::Square),
+            InstanceMethod("neg", &CompiledGraphWrap::Neg_),
+            InstanceMethod("abs", &CompiledGraphWrap::Abs_),
+            InstanceMethod("sigmoid", &CompiledGraphWrap::Sigmoid),
+            InstanceMethod("tanh", &CompiledGraphWrap::Tanh_),
+            InstanceMethod("silu", &CompiledGraphWrap::Silu),
+            InstanceMethod("gelu", &CompiledGraphWrap::Gelu),
+            InstanceMethod("softplus", &CompiledGraphWrap::Softplus),
+            InstanceMethod("sin", &CompiledGraphWrap::Sin_),
+            InstanceMethod("cos", &CompiledGraphWrap::Cos_),
+            // Parameterized unary
+            InstanceMethod("pow_scalar", &CompiledGraphWrap::PowScalar),
+            InstanceMethod("mul_scalar", &CompiledGraphWrap::MulScalar_),
+            InstanceMethod("add_scalar", &CompiledGraphWrap::AddScalar_),
+            // Binary
+            InstanceMethod("add", &CompiledGraphWrap::Add_),
+            InstanceMethod("sub", &CompiledGraphWrap::Sub_),
+            InstanceMethod("mul", &CompiledGraphWrap::Mul_),
+            InstanceMethod("div", &CompiledGraphWrap::Div__),
+            InstanceMethod("pow", &CompiledGraphWrap::Pow__),
+            // Matmul
+            InstanceMethod("matmul", &CompiledGraphWrap::Matmul_),
+            // Reduce
+            InstanceMethod("sum", &CompiledGraphWrap::Sum_),
+            InstanceMethod("mean", &CompiledGraphWrap::Mean_),
+            // View
+            InstanceMethod("transpose", &CompiledGraphWrap::Transpose_),
+            // Run
+            InstanceMethod("run", &CompiledGraphWrap::Run),
+        });
+        exports.Set("CompiledGraph", func);
+        return exports;
+    }
+
+    CompiledGraphWrap(const Napi::CallbackInfo& info)
+        : Napi::ObjectWrap<CompiledGraphWrap>(info) {}
+
+    // Slot allocation
+    Napi::Value Input(const Napi::CallbackInfo& info) {
+        return Napi::Number::New(info.Env(), graph_.input());
+    }
+    Napi::Value Target(const Napi::CallbackInfo& info) {
+        return Napi::Number::New(info.Env(), graph_.target());
+    }
+    Napi::Value Param(const Napi::CallbackInfo& info) {
+        return Napi::Number::New(info.Env(), graph_.param());
+    }
+    Napi::Value SetOutput(const Napi::CallbackInfo& info) {
+        graph_.set_output(info[0].As<Napi::Number>().Int32Value());
+        return info.Env().Undefined();
+    }
+
+    // Unary ops
+    #define CG_UNARY(Name, OpT) \
+    Napi::Value Name(const Napi::CallbackInfo& info) { \
+        return Napi::Number::New(info.Env(), graph_.op1(OpType::OpT, info[0].As<Napi::Number>().Int32Value())); \
+    }
+    CG_UNARY(Relu, RELU)       CG_UNARY(Exp, EXP)         CG_UNARY(Log, LOG)
+    CG_UNARY(Sqrt, SQRT)       CG_UNARY(Square, SQUARE)   CG_UNARY(Neg_, NEG)
+    CG_UNARY(Abs_, ABS)        CG_UNARY(Sigmoid, SIGMOID) CG_UNARY(Tanh_, TANH)
+    CG_UNARY(Silu, SILU)       CG_UNARY(Gelu, GELU)       CG_UNARY(Softplus, SOFTPLUS)
+    CG_UNARY(Sin_, SIN)        CG_UNARY(Cos_, COS)
+
+    // Parameterized unary
+    Napi::Value PowScalar(const Napi::CallbackInfo& info) {
+        return Napi::Number::New(info.Env(), graph_.op1(OpType::POW_SCALAR,
+            info[0].As<Napi::Number>().Int32Value(), info[1].As<Napi::Number>().FloatValue()));
+    }
+    Napi::Value MulScalar_(const Napi::CallbackInfo& info) {
+        return Napi::Number::New(info.Env(), graph_.op1(OpType::MUL_SCALAR,
+            info[0].As<Napi::Number>().Int32Value(), info[1].As<Napi::Number>().FloatValue()));
+    }
+    Napi::Value AddScalar_(const Napi::CallbackInfo& info) {
+        return Napi::Number::New(info.Env(), graph_.op1(OpType::ADD_SCALAR,
+            info[0].As<Napi::Number>().Int32Value(), info[1].As<Napi::Number>().FloatValue()));
+    }
+
+    // Binary ops
+    #define CG_BINARY(Name, OpT) \
+    Napi::Value Name(const Napi::CallbackInfo& info) { \
+        return Napi::Number::New(info.Env(), graph_.op2(OpType::OpT, \
+            info[0].As<Napi::Number>().Int32Value(), info[1].As<Napi::Number>().Int32Value())); \
+    }
+    CG_BINARY(Add_, ADD)   CG_BINARY(Sub_, SUB)   CG_BINARY(Mul_, MUL)
+    CG_BINARY(Div__, DIV)  CG_BINARY(Pow__, POW)  CG_BINARY(Matmul_, MATMUL)
+
+    // Reduce
+    Napi::Value Sum_(const Napi::CallbackInfo& info) {
+        int a = info[0].As<Napi::Number>().Int32Value();
+        int dim = info.Length() > 1 ? info[1].As<Napi::Number>().Int32Value() : -1;
+        bool keepdim = info.Length() > 2 ? info[2].As<Napi::Boolean>().Value() : false;
+        return Napi::Number::New(info.Env(), graph_.op1(OpType::SUM, a, 0, dim, keepdim ? 1 : 0));
+    }
+    Napi::Value Mean_(const Napi::CallbackInfo& info) {
+        int a = info[0].As<Napi::Number>().Int32Value();
+        int dim = info.Length() > 1 ? info[1].As<Napi::Number>().Int32Value() : -1;
+        bool keepdim = info.Length() > 2 ? info[2].As<Napi::Boolean>().Value() : false;
+        return Napi::Number::New(info.Env(), graph_.op1(OpType::MEAN, a, 0, dim, keepdim ? 1 : 0));
+    }
+
+    // View
+    Napi::Value Transpose_(const Napi::CallbackInfo& info) {
+        int a = info[0].As<Napi::Number>().Int32Value();
+        if (info.Length() >= 3) {
+            int d0 = info[1].As<Napi::Number>().Int32Value();
+            int d1 = info[2].As<Napi::Number>().Int32Value();
+            return Napi::Number::New(info.Env(), graph_.op1(OpType::TRANSPOSE2, a, 0, d0, d1));
+        }
+        return Napi::Number::New(info.Env(), graph_.op1(OpType::TRANSPOSE, a));
+    }
+
+    // Run: forward + backward + Adam, all in C++
+    Napi::Value Run(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        // args: input(Tensor), target(Tensor), params(Tensor[]), m(Tensor[]), v(Tensor[]),
+        //       lr, beta1, beta2, eps, bc1, bc2, wd
+        auto* inp = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        auto* tgt = Napi::ObjectWrap<TensorWrap>::Unwrap(info[1].As<Napi::Object>());
+
+        Napi::Array p_arr = info[2].As<Napi::Array>();
+        Napi::Array m_arr = info[3].As<Napi::Array>();
+        Napi::Array v_arr = info[4].As<Napi::Array>();
+        uint32_t np = p_arr.Length();
+
+        std::vector<Tensor> params, ms, vs;
+        params.reserve(np); ms.reserve(np); vs.reserve(np);
+        for (uint32_t i = 0; i < np; i++) {
+            params.push_back(Napi::ObjectWrap<TensorWrap>::Unwrap(p_arr.Get(i).As<Napi::Object>())->tensor_);
+            ms.push_back(Napi::ObjectWrap<TensorWrap>::Unwrap(m_arr.Get(i).As<Napi::Object>())->tensor_);
+            vs.push_back(Napi::ObjectWrap<TensorWrap>::Unwrap(v_arr.Get(i).As<Napi::Object>())->tensor_);
+        }
+
+        float lr  = info[5].As<Napi::Number>().FloatValue();
+        float b1  = info[6].As<Napi::Number>().FloatValue();
+        float b2  = info[7].As<Napi::Number>().FloatValue();
+        float eps = info[8].As<Napi::Number>().FloatValue();
+        float bc1 = info[9].As<Napi::Number>().FloatValue();
+        float bc2 = info[10].As<Napi::Number>().FloatValue();
+        float wd  = info[11].As<Napi::Number>().FloatValue();
+
+        graph_.run(inp->tensor_, tgt->tensor_, params, ms, vs, lr, b1, b2, eps, bc1, bc2, wd);
+
+        // Write back updated params/m/v (adam modifies in-place via pointers)
+        // The Tensor objects are shared via shared_ptr, so the JS-side Tensors are already updated.
+
+        return env.Undefined();
+    }
+};
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
-    return TensorWrap::Init(env, exports);
+    TensorWrap::Init(env, exports);
+    GradTensorWrap::Init(env, exports);
+    CompiledGraphWrap::Init(env, exports);
+    return exports;
 }
 
 NODE_API_MODULE(jstorch, Init)

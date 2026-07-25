@@ -12,6 +12,25 @@ struct BroadcastArgs {
     int ndim;
 };
 
+// Fast path: contiguous same-shape, vectorized float4
+template<typename BinaryOp>
+__global__ void binary_vec4(const float4* __restrict__ a, const float4* __restrict__ b,
+                            float4* __restrict__ out, int n4, BinaryOp op) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += blockDim.x * gridDim.x) {
+        float4 va = a[i], vb = b[i], vo;
+        vo.x = op(va.x, vb.x); vo.y = op(va.y, vb.y);
+        vo.z = op(va.z, vb.z); vo.w = op(va.w, vb.w);
+        out[i] = vo;
+    }
+}
+
+template<typename BinaryOp>
+__global__ void binary_tail(const float* a, const float* b, float* out, int offset, int size, BinaryOp op) {
+    int i = offset + blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) out[i] = op(a[i], b[i]);
+}
+
+// Broadcast path: index calculation per element
 template<typename BinaryOp>
 __global__ void broadcast_kernel(
     const float* a, const float* b,
@@ -64,6 +83,28 @@ void launch_broadcast(
     float* out, const int* out_shape, int ndim, int total_size,
     BinaryOp op, cudaStream_t stream
 ) {
+    // Fast path: same shape, both contiguous → vectorized
+    bool same_shape = true;
+    for (int i = 0; i < ndim; i++) {
+        if (a_shape[i] != b_shape[i]) { same_shape = false; break; }
+    }
+    if (same_shape) {
+        constexpr int threads = 128;
+        int n4 = total_size / 4;
+        if (n4 > 0) {
+            int blocks = min((n4 + threads - 1) / threads, 1024);
+            binary_vec4<<<blocks, threads, 0, stream>>>(
+                reinterpret_cast<const float4*>(a),
+                reinterpret_cast<const float4*>(b),
+                reinterpret_cast<float4*>(out), n4, op);
+        }
+        int tail = total_size - n4 * 4;
+        if (tail > 0)
+            binary_tail<<<1, tail, 0, stream>>>(a, b, out, n4 * 4, total_size, op);
+        return;
+    }
+
+    // Broadcast path
     BroadcastArgs args;
     args.ndim = ndim;
     for (int i = 0; i < ndim; i++) {
@@ -73,8 +114,8 @@ void launch_broadcast(
         args.b_strides[i] = b_strides[i];
         args.out_shape[i] = out_shape[i];
     }
-    int threads = 256;
-    int blocks = (total_size + threads - 1) / threads;
+    int threads = 128;
+    int blocks = min((total_size + threads - 1) / threads, 2048);
     broadcast_kernel<<<blocks, threads, 0, stream>>>(a, b, out, args, total_size, op);
 }
 

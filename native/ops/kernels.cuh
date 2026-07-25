@@ -4,18 +4,36 @@
 namespace jstorch {
 namespace ops {
 
-// 通用一元操作kernel
+// Vectorized unary kernel: float4 load/store, 128 threads, grid-stride loop
 template<typename UnaryOp>
-__global__ void unary_kernel(const float* input, float* output, int size, UnaryOp op) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) output[idx] = op(input[idx]);
+__global__ void unary_kernel_vec4(const float4* __restrict__ in, float4* __restrict__ out, int n4, UnaryOp op) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += blockDim.x * gridDim.x) {
+        float4 v = in[i];
+        v.x = op(v.x); v.y = op(v.y); v.z = op(v.z); v.w = op(v.w);
+        out[i] = v;
+    }
+}
+
+template<typename UnaryOp>
+__global__ void unary_kernel_tail(const float* in, float* out, int offset, int size, UnaryOp op) {
+    int i = offset + blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) out[i] = op(in[i]);
 }
 
 template<typename UnaryOp>
 void launch_unary(const float* input, float* output, int size, UnaryOp op, cudaStream_t stream) {
-    int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    unary_kernel<<<blocks, threads, 0, stream>>>(input, output, size, op);
+    constexpr int threads = 128;
+    int n4 = size / 4;
+    if (n4 > 0) {
+        int blocks = min((n4 + threads - 1) / threads, 1024);
+        unary_kernel_vec4<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const float4*>(input),
+            reinterpret_cast<float4*>(output), n4, op);
+    }
+    int tail = size - n4 * 4;
+    if (tail > 0) {
+        unary_kernel_tail<<<1, tail, 0, stream>>>(input, output, n4 * 4, size, op);
+    }
 }
 
 // 函数对象
