@@ -164,6 +164,8 @@ public: // data_ needs friend access from static methods
             StaticMethod("convTranspose2dBackwardWeight", &TensorWrap::ConvTranspose2dBackwardWeight),
             
             // Static methods
+            StaticMethod("rnnForward", &TensorWrap::RnnForward),
+            StaticMethod("rnnBackward", &TensorWrap::RnnBackward),
             StaticMethod("cat", &TensorWrap::Cat),
             StaticMethod("where", &TensorWrap::Where),
             StaticMethod("fromBuffer", &TensorWrap::FromBuffer),
@@ -588,6 +590,66 @@ public: // data_ needs friend access from static methods
     }
 
     // ==================== Static methods ====================
+    // Helper to extract Tensor array from JS array
+    static std::vector<Tensor> extractTensorArray(const Napi::Array& arr) {
+        std::vector<Tensor> v;
+        for (uint32_t i = 0; i < arr.Length(); i++)
+            v.push_back(Napi::ObjectWrap<TensorWrap>::Unwrap(arr.Get(i).As<Napi::Object>())->tensor_);
+        return v;
+    }
+
+    static const Tensor* nullableArg(const Napi::Value& val) {
+        if (val.IsNull() || val.IsUndefined()) return nullptr;
+        return &Napi::ObjectWrap<TensorWrap>::Unwrap(val.As<Napi::Object>())->tensor_;
+    }
+
+    // rnnForward(x, hx_or_null, cx_or_null, wih[], whh[], bih[], bhh[], mode, hiddenSize, numLayers, bidir)
+    static Napi::Value RnnForward(const Napi::CallbackInfo& info) {
+        auto env = info.Env();
+        auto& x = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>())->tensor_;
+        auto wih = extractTensorArray(info[3].As<Napi::Array>());
+        auto whh = extractTensorArray(info[4].As<Napi::Array>());
+        auto bih = extractTensorArray(info[5].As<Napi::Array>());
+        auto bhh = extractTensorArray(info[6].As<Napi::Array>());
+
+        auto result = Tensor::rnn_forward(x, nullableArg(info[1]), nullableArg(info[2]),
+            wih, whh, bih, bhh,
+            info[7].As<Napi::Number>().Int32Value(),
+            info[8].As<Napi::Number>().Int32Value(),
+            info[9].As<Napi::Number>().Int32Value(),
+            info[10].As<Napi::Number>().Int32Value());
+
+        auto arr = Napi::Array::New(env, result.size());
+        for (size_t i = 0; i < result.size(); i++)
+            arr.Set(i, TensorWrap::Wrap(env, std::move(result[i])));
+        return arr;
+    }
+
+    // rnnBackward(x, hx, cx, y, dy, dhy, dcy, wih[], whh[], bih[], bhh[], mode, hiddenSize, numLayers, bidir)
+    static Napi::Value RnnBackward(const Napi::CallbackInfo& info) {
+        auto env = info.Env();
+        auto& x = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>())->tensor_;
+        auto& y = Napi::ObjectWrap<TensorWrap>::Unwrap(info[3].As<Napi::Object>())->tensor_;
+        auto& dy = Napi::ObjectWrap<TensorWrap>::Unwrap(info[4].As<Napi::Object>())->tensor_;
+        auto wih = extractTensorArray(info[7].As<Napi::Array>());
+        auto whh = extractTensorArray(info[8].As<Napi::Array>());
+        auto bih = extractTensorArray(info[9].As<Napi::Array>());
+        auto bhh = extractTensorArray(info[10].As<Napi::Array>());
+
+        auto result = Tensor::rnn_backward(x, nullableArg(info[1]), nullableArg(info[2]),
+            y, dy, nullableArg(info[5]), nullableArg(info[6]),
+            wih, whh, bih, bhh,
+            info[11].As<Napi::Number>().Int32Value(),
+            info[12].As<Napi::Number>().Int32Value(),
+            info[13].As<Napi::Number>().Int32Value(),
+            info[14].As<Napi::Number>().Int32Value());
+
+        auto arr = Napi::Array::New(env, result.size());
+        for (size_t i = 0; i < result.size(); i++)
+            arr.Set(i, TensorWrap::Wrap(env, std::move(result[i])));
+        return arr;
+    }
+
     static Napi::Value Cat(const Napi::CallbackInfo& info) {
         Napi::Env env = info.Env();
         Napi::Array arr = info[0].As<Napi::Array>();
@@ -1126,6 +1188,13 @@ public:
             InstanceMethod("batch_norm2d", &CompiledGraphWrap::BatchNorm2d_),
             // Buffer
             InstanceMethod("buffer", &CompiledGraphWrap::Buffer),
+            // Loop
+            InstanceMethod("loop_begin", &CompiledGraphWrap::LoopBegin),
+            InstanceMethod("loop_slice", &CompiledGraphWrap::LoopSlice),
+            InstanceMethod("loop_carry", &CompiledGraphWrap::LoopCarry),
+            InstanceMethod("loop_end", &CompiledGraphWrap::LoopEnd),
+            // Fused ops
+            InstanceMethod("rnn_cudnn", &CompiledGraphWrap::RnnCudnn),
             // Run
             InstanceMethod("run", &CompiledGraphWrap::Run),
         });
@@ -1278,6 +1347,60 @@ public:
         return Napi::Number::New(info.Env(), graph_.buffer());
     }
 
+    // Loop
+    Napi::Value LoopBegin(const Napi::CallbackInfo& info) {
+        graph_.loop_begin(info[0].As<Napi::Number>().Int32Value());
+        return info.Env().Undefined();
+    }
+    Napi::Value LoopSlice(const Napi::CallbackInfo& info) {
+        int seq = info[0].As<Napi::Number>().Int32Value();
+        int dim = info[1].As<Napi::Number>().Int32Value();
+        return Napi::Number::New(info.Env(), graph_.loop_slice(seq, dim));
+    }
+    Napi::Value LoopCarry(const Napi::CallbackInfo& info) {
+        int from = info[0].As<Napi::Number>().Int32Value();
+        int to = info[1].As<Napi::Number>().Int32Value();
+        graph_.loop_carry(from, to);
+        return info.Env().Undefined();
+    }
+    Napi::Value LoopEnd(const Napi::CallbackInfo& info) {
+        graph_.loop_end();
+        return info.Env().Undefined();
+    }
+
+    // rnn_cudnn(x_slot, hx_slot, cx_slot, wih_slots[], whh_slots[], bih_slots[], bhh_slots[],
+    //           mode, hidden_size, num_layers, bidirectional)
+    // returns [y_slot, hy_slot, cy_slot]
+    Napi::Value RnnCudnn(const Napi::CallbackInfo& info) {
+        auto env = info.Env();
+        int x_slot = info[0].As<Napi::Number>().Int32Value();
+        int hx_slot = info[1].IsNull() || info[1].IsUndefined() ? -1 : info[1].As<Napi::Number>().Int32Value();
+        int cx_slot = info[2].IsNull() || info[2].IsUndefined() ? -1 : info[2].As<Napi::Number>().Int32Value();
+
+        auto extractSlots = [](const Napi::Array& arr) -> std::vector<int> {
+            std::vector<int> v;
+            for (uint32_t i = 0; i < arr.Length(); i++)
+                v.push_back(arr.Get(i).As<Napi::Number>().Int32Value());
+            return v;
+        };
+        auto wih = extractSlots(info[3].As<Napi::Array>());
+        auto whh = extractSlots(info[4].As<Napi::Array>());
+        auto bih = extractSlots(info[5].As<Napi::Array>());
+        auto bhh = extractSlots(info[6].As<Napi::Array>());
+        int mode = info[7].As<Napi::Number>().Int32Value();
+        int hidden = info[8].As<Napi::Number>().Int32Value();
+        int layers = info[9].As<Napi::Number>().Int32Value();
+        int bidir = info[10].As<Napi::Number>().Int32Value();
+
+        auto result = graph_.rnn_cudnn(x_slot, hx_slot, cx_slot, wih, whh, bih, bhh,
+                                        mode, hidden, layers, bidir);
+        auto arr = Napi::Array::New(env, 3);
+        arr.Set((uint32_t)0, Napi::Number::New(env, result[0]));
+        arr.Set((uint32_t)1, Napi::Number::New(env, result[1]));
+        arr.Set((uint32_t)2, Napi::Number::New(env, result[2]));
+        return arr;
+    }
+
     // Run: forward + backward + Adam, all in C++
     Napi::Value Run(const Napi::CallbackInfo& info) {
         Napi::Env env = info.Env();
@@ -1319,7 +1442,7 @@ public:
             bufs_ptr = &bufs;
         }
 
-        graph_.run(inp->tensor_, tgt->tensor_, params, ms, vs, lr, b1, b2, eps, bc1, bc2, wd, bufs_ptr);
+        graph_.run_tape(inp->tensor_, tgt->tensor_, params, ms, vs, lr, b1, b2, eps, bc1, bc2, wd, bufs_ptr);
 
         return env.Undefined();
     }

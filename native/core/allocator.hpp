@@ -137,4 +137,74 @@ inline CudaAllocator& get_allocator() {
     return alloc;
 }
 
+// ==============================================================================
+// ArenaAllocator: Bump allocator for CompiledGraph execution.
+// Zero overhead: O(1) allocate, no mutex, no free list.
+// Reset offset to 0 at start of each run_tape() call.
+// ==============================================================================
+class ArenaAllocator {
+    static constexpr size_t ALIGNMENT = 512;
+    void* base_ = nullptr;
+    size_t capacity_ = 0;
+    size_t offset_ = 0;
+
+    static size_t align_up(size_t n) {
+        return (n + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    }
+
+public:
+    void ensure(size_t min_cap) {
+        if (capacity_ >= min_cap) return;
+        if (base_) cudaFree(base_);
+        // Add 20% headroom
+        capacity_ = min_cap + min_cap / 5;
+        capacity_ = align_up(capacity_);
+        cudaError_t err = cudaMalloc(&base_, capacity_);
+        if (err != cudaSuccess)
+            throw std::runtime_error("Arena cudaMalloc failed");
+    }
+
+    void reset() { offset_ = 0; }
+
+    void* allocate(size_t bytes) {
+        if (bytes == 0) bytes = ALIGNMENT;
+        size_t size = align_up(bytes);
+        if (offset_ + size > capacity_) {
+            // Grow arena
+            size_t new_cap = (offset_ + size) * 2;
+            void* new_base = nullptr;
+            cudaError_t err = cudaMalloc(&new_base, new_cap);
+            if (err != cudaSuccess)
+                throw std::runtime_error("Arena grow failed");
+            cudaMemcpy(new_base, base_, offset_, cudaMemcpyDeviceToDevice);
+            if (base_) cudaFree(base_);
+            base_ = new_base;
+            capacity_ = new_cap;
+        }
+        void* ptr = (char*)base_ + offset_;
+        offset_ += size;
+        return ptr;
+    }
+
+    void free(void*, size_t) {} // no-op
+
+    size_t used() const { return offset_; }
+    size_t cap() const { return capacity_; }
+
+    ~ArenaAllocator() { if (base_) cudaFree(base_); }
+};
+
+// Thread-local arena mode: when active, allocations go to arena instead of pool
+inline thread_local ArenaAllocator* active_arena = nullptr;
+
+inline void* alloc_gpu(size_t bytes) {
+    if (active_arena) return active_arena->allocate(bytes);
+    return get_allocator().allocate(bytes);
+}
+
+inline void free_gpu(void* ptr, size_t bytes) {
+    if (active_arena) { active_arena->free(ptr, bytes); return; }
+    get_allocator().free(ptr, bytes);
+}
+
 }

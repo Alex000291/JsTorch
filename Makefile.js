@@ -30,7 +30,7 @@ fs.mkdirSync('build/obj', { recursive: true });
 
 const sources = {
     cpp: ['native/core/tensor.cpp', 'native/binding/napi.cpp'],
-    cuda: ['native/ops/unary.cu', 'native/ops/binary.cu', 'native/ops/reduce.cu', 'native/ops/misc.cu', 'native/ops/matmul.cu', 'native/ops/conv.cu', 'native/audio/stft.cu']
+    cuda: ['native/ops/unary.cu', 'native/ops/binary.cu', 'native/ops/reduce.cu', 'native/ops/misc.cu', 'native/ops/matmul.cu', 'native/ops/conv.cu', 'native/ops/rnn.cu', 'native/audio/stft.cu']
 };
 
 const includes = `-Inode_modules\\node-addon-api -Inode_modules\\node-api-headers\\include -I"${CUDA_PATH}\\include" -Ibuild\\win\\include -Inative/core -Inative/ops`;

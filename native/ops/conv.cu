@@ -21,9 +21,23 @@ struct ConvParams {
     }
 };
 
+// Shared workspace: all cuDNN ops share one buffer (only one op runs at a time)
+void* shared_ws_ptr = nullptr;
+size_t shared_ws_cap = 0;
+
+void* get_workspace(size_t needed) {
+    if (needed == 0) return nullptr;
+    if (needed > shared_ws_cap) {
+        if (shared_ws_ptr) cudaFree(shared_ws_ptr);
+        cudaMalloc(&shared_ws_ptr, needed);
+        shared_ws_cap = needed;
+    }
+    return shared_ws_ptr;
+}
+
 struct ConvPlan {
     cudnnConvolutionFwdAlgo_t algo;
-    void* ws; size_t ws_size;
+    size_t ws_size;
 };
 
 // === Conv1d via im2col + matmul ===
@@ -553,15 +567,14 @@ void launch_conv2d_cudnn(const float* input, const float* weight, const float* b
         int count;
         cudnnConvolutionFwdAlgoPerf_t perf;
         cudnnGetConvolutionForwardAlgorithm_v7(handle, xDesc, wDesc, convDesc, yDesc, 1, &count, &perf);
-        p.algo = perf.algo; p.ws = nullptr; p.ws_size = 0;
+        p.algo = perf.algo; p.ws_size = 0;
         cudnnGetConvolutionForwardWorkspaceSize(handle, xDesc, wDesc, convDesc, yDesc, p.algo, &p.ws_size);
-        if (p.ws_size > 0) cudaMalloc(&p.ws, p.ws_size);
         it = plan_cache.emplace(params, p).first;
     }
     const auto& plan = it->second;
     
     float alpha = 1.0f, beta = 0.0f;
-    cudnnConvolutionForward(handle, &alpha, xDesc, input, wDesc, weight, convDesc, plan.algo, plan.ws, plan.ws_size, &beta, yDesc, output);
+    cudnnConvolutionForward(handle, &alpha, xDesc, input, wDesc, weight, convDesc, plan.algo, get_workspace(plan.ws_size), plan.ws_size, &beta, yDesc, output);
     
     if (bias) {
         cudnnCreateTensorDescriptor(&bDesc);
@@ -581,9 +594,9 @@ void launch_conv2d_cudnn(const float* input, const float* weight, const float* b
 
 struct ConvBwdPlan {
     cudnnConvolutionBwdDataAlgo_t data_algo;
-    void* data_ws; size_t data_ws_size;
+    size_t data_ws_size;
     cudnnConvolutionBwdFilterAlgo_t filter_algo;
-    void* filter_ws; size_t filter_ws_size;
+    size_t filter_ws_size;
 };
 
 void launch_conv2d_backward_cudnn(
@@ -620,14 +633,12 @@ void launch_conv2d_backward_cudnn(
         int count;
         cudnnConvolutionBwdDataAlgoPerf_t dperf;
         cudnnGetConvolutionBackwardDataAlgorithm_v7(handle, wDesc, dyDesc, convDesc, xDesc, 1, &count, &dperf);
-        p.data_algo = dperf.algo; p.data_ws = nullptr; p.data_ws_size = 0;
+        p.data_algo = dperf.algo; p.data_ws_size = 0;
         cudnnGetConvolutionBackwardDataWorkspaceSize(handle, wDesc, dyDesc, convDesc, xDesc, p.data_algo, &p.data_ws_size);
-        if (p.data_ws_size > 0) cudaMalloc(&p.data_ws, p.data_ws_size);
         cudnnConvolutionBwdFilterAlgoPerf_t fperf;
         cudnnGetConvolutionBackwardFilterAlgorithm_v7(handle, xDesc, dyDesc, convDesc, wDesc, 1, &count, &fperf);
-        p.filter_algo = fperf.algo; p.filter_ws = nullptr; p.filter_ws_size = 0;
+        p.filter_algo = fperf.algo; p.filter_ws_size = 0;
         cudnnGetConvolutionBackwardFilterWorkspaceSize(handle, xDesc, dyDesc, convDesc, wDesc, p.filter_algo, &p.filter_ws_size);
-        if (p.filter_ws_size > 0) cudaMalloc(&p.filter_ws, p.filter_ws_size);
         it = bwd_cache.emplace(params, p).first;
     }
     const auto& plan = it->second;
@@ -635,10 +646,10 @@ void launch_conv2d_backward_cudnn(
     
     if (grad_input)
         cudnnConvolutionBackwardData(handle, &alpha, wDesc, weight, dyDesc, grad_output,
-            convDesc, plan.data_algo, plan.data_ws, plan.data_ws_size, &beta, xDesc, grad_input);
+            convDesc, plan.data_algo, get_workspace(plan.data_ws_size), plan.data_ws_size, &beta, xDesc, grad_input);
     if (grad_weight)
         cudnnConvolutionBackwardFilter(handle, &alpha, xDesc, input, dyDesc, grad_output,
-            convDesc, plan.filter_algo, plan.filter_ws, plan.filter_ws_size, &beta, wDesc, grad_weight);
+            convDesc, plan.filter_algo, get_workspace(plan.filter_ws_size), plan.filter_ws_size, &beta, wDesc, grad_weight);
     if (grad_bias) {
         cudnnTensorDescriptor_t dbDesc;
         cudnnCreateTensorDescriptor(&dbDesc);

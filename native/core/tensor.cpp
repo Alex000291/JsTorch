@@ -110,6 +110,20 @@ extern "C" {
         int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, cudaStream_t);
 }
 
+// cuDNN RNN (C++ linkage, not extern "C")
+void launch_rnn_forward_cudnn(
+    const float*, const float*, const float*,
+    float*, float*, float*,
+    const float* const*, const float* const*, const float* const*, const float* const*,
+    int, int, int, int, int, int, int, cudaStream_t);
+void launch_rnn_backward_cudnn(
+    const float*, const float*, const float*,
+    const float*, const float*, const float*, const float*,
+    float*, float*, float*,
+    const float* const*, const float* const*, const float* const*, const float* const*,
+    float* const*, float* const*, float* const*, float* const*,
+    int, int, int, int, int, int, int, cudaStream_t);
+
 // ==================== Helpers ====================
 static int* to_device(const std::vector<int>& vec) {
     int* d; cudaMalloc(&d, vec.size() * sizeof(int));
@@ -138,8 +152,13 @@ Tensor::Tensor(const Shape& shape, DType dtype)
     : dtype_(dtype), shape_(shape), strides_(compute_strides(shape)),
       stream_(0), owns_stream_(false) {
     size_t bytes = size() * dtype_size(dtype_);
-    void* ptr = get_allocator().allocate(bytes);
-    data_ = std::shared_ptr<void>(ptr, [bytes](void* p) { get_allocator().free(p, bytes); });
+    void* ptr = alloc_gpu(bytes);
+    // If allocating from arena, use no-op deleter (arena manages lifetime)
+    if (active_arena) {
+        data_ = std::shared_ptr<void>(ptr, [](void*) {});
+    } else {
+        data_ = std::shared_ptr<void>(ptr, [bytes](void* p) { get_allocator().free(p, bytes); });
+    }
 }
 
 Tensor::Tensor(std::shared_ptr<void> data, const Shape& shape, const Strides& strides,
@@ -853,6 +872,111 @@ void Tensor::conv2d_backward_cudnn(const Tensor& input, const Tensor& weight, co
         grad_input.data<float>(), grad_weight.data<float>(),
         grad_bias ? grad_bias->data<float>() : nullptr,
         B, Ci, H, W, Co, kH, kW, sH, sW, pH, pW, dH, dW, groups, Ho, Wo, 0);
+}
+
+// cuDNN RNN forward
+std::vector<Tensor> Tensor::rnn_forward(const Tensor& x, const Tensor* hx, const Tensor* cx,
+                                         const std::vector<Tensor>& weights_ih, const std::vector<Tensor>& weights_hh,
+                                         const std::vector<Tensor>& biases_ih, const std::vector<Tensor>& biases_hh,
+                                         int mode, int hidden_size, int num_layers, int bidirectional) {
+    int B = x.shape()[0], seq_len = x.shape()[1], input_size = x.shape()[2];
+    int num_dir = bidirectional ? 2 : 1;
+    int out_size = hidden_size * num_dir;
+
+    Tensor y({B, seq_len, out_size}, x.dtype());
+    Tensor hy({num_layers * num_dir, B, hidden_size}, x.dtype());
+
+    // Collect raw pointers
+    std::vector<const float*> wih_ptrs, whh_ptrs, bih_ptrs, bhh_ptrs;
+    for (auto& t : weights_ih) wih_ptrs.push_back(t.contiguous().data<float>());
+    for (auto& t : weights_hh) whh_ptrs.push_back(t.contiguous().data<float>());
+    for (auto& t : biases_ih) bih_ptrs.push_back(t.contiguous().data<float>());
+    for (auto& t : biases_hh) bhh_ptrs.push_back(t.contiguous().data<float>());
+
+    bool is_lstm = (mode == 2);
+    float* cy_ptr = nullptr;
+    Tensor cy_t({1});  // placeholder
+    if (is_lstm) {
+        cy_t = Tensor({num_layers * num_dir, B, hidden_size}, x.dtype());
+        cy_ptr = cy_t.data<float>();
+    }
+
+    launch_rnn_forward_cudnn(
+        x.contiguous().data<float>(),
+        hx ? hx->contiguous().data<float>() : nullptr,
+        cx ? cx->contiguous().data<float>() : nullptr,
+        y.data<float>(), hy.data<float>(), cy_ptr,
+        wih_ptrs.data(), whh_ptrs.data(), bih_ptrs.data(), bhh_ptrs.data(),
+        mode, B, seq_len, input_size, hidden_size, num_layers, bidirectional, 0);
+
+    std::vector<Tensor> result = {y, hy};
+    if (is_lstm) result.push_back(cy_t);
+    return result;
+}
+
+// cuDNN RNN backward
+std::vector<Tensor> Tensor::rnn_backward(const Tensor& x, const Tensor* hx, const Tensor* cx,
+                                          const Tensor& y, const Tensor& dy, const Tensor* dhy, const Tensor* dcy,
+                                          const std::vector<Tensor>& weights_ih, const std::vector<Tensor>& weights_hh,
+                                          const std::vector<Tensor>& biases_ih, const std::vector<Tensor>& biases_hh,
+                                          int mode, int hidden_size, int num_layers, int bidirectional) {
+    int B = x.shape()[0], seq_len = x.shape()[1], input_size = x.shape()[2];
+    int num_dir = bidirectional ? 2 : 1;
+    bool is_lstm = (mode == 2);
+    int n_params = num_layers * num_dir;
+
+    Tensor dx(x.shape(), x.dtype());
+    Tensor dhx({num_layers * num_dir, B, hidden_size}, x.dtype());
+    Tensor dcx_t({1});  // placeholder
+    float* dcx_ptr = nullptr;
+    if (is_lstm) {
+        dcx_t = Tensor({num_layers * num_dir, B, hidden_size}, x.dtype());
+        dcx_ptr = dcx_t.data<float>();
+    }
+
+    // Allocate grad weight tensors
+    std::vector<Tensor> dwih, dwhh, dbih, dbhh;
+    for (int i = 0; i < n_params; i++) {
+        dwih.push_back(Tensor(weights_ih[i].shape(), x.dtype()));
+        dwhh.push_back(Tensor(weights_hh[i].shape(), x.dtype()));
+        dbih.push_back(Tensor(biases_ih[i].shape(), x.dtype()));
+        dbhh.push_back(Tensor(biases_hh[i].shape(), x.dtype()));
+    }
+
+    std::vector<const float*> wih_ptrs, whh_ptrs, bih_ptrs, bhh_ptrs;
+    std::vector<float*> dwih_ptrs, dwhh_ptrs, dbih_ptrs, dbhh_ptrs;
+    for (auto& t : weights_ih) wih_ptrs.push_back(t.contiguous().data<float>());
+    for (auto& t : weights_hh) whh_ptrs.push_back(t.contiguous().data<float>());
+    for (auto& t : biases_ih) bih_ptrs.push_back(t.contiguous().data<float>());
+    for (auto& t : biases_hh) bhh_ptrs.push_back(t.contiguous().data<float>());
+    for (auto& t : dwih) dwih_ptrs.push_back(t.data<float>());
+    for (auto& t : dwhh) dwhh_ptrs.push_back(t.data<float>());
+    for (auto& t : dbih) dbih_ptrs.push_back(t.data<float>());
+    for (auto& t : dbhh) dbhh_ptrs.push_back(t.data<float>());
+
+    launch_rnn_backward_cudnn(
+        x.contiguous().data<float>(),
+        hx ? hx->contiguous().data<float>() : nullptr,
+        cx ? cx->contiguous().data<float>() : nullptr,
+        y.contiguous().data<float>(),
+        dy.contiguous().data<float>(),
+        dhy ? dhy->contiguous().data<float>() : nullptr,
+        dcy ? dcy->contiguous().data<float>() : nullptr,
+        dx.data<float>(), dhx.data<float>(), dcx_ptr,
+        wih_ptrs.data(), whh_ptrs.data(), bih_ptrs.data(), bhh_ptrs.data(),
+        dwih_ptrs.data(), dwhh_ptrs.data(), dbih_ptrs.data(), dbhh_ptrs.data(),
+        mode, B, seq_len, input_size, hidden_size, num_layers, bidirectional, 0);
+
+    // Pack results: dx, dhx, [dcx], then interleaved weight grads
+    std::vector<Tensor> result = {dx, dhx};
+    if (is_lstm) result.push_back(dcx_t);
+    for (int i = 0; i < n_params; i++) {
+        result.push_back(dwih[i]);
+        result.push_back(dwhh[i]);
+        result.push_back(dbih[i]);
+        result.push_back(dbhh[i]);
+    }
+    return result;
 }
 
 // ConvTranspose1d backward weight

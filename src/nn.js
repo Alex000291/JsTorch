@@ -369,6 +369,73 @@ class GroupNorm extends Module {
     }
 }
 
+// ==================== RNN ====================
+class RNN extends Module {
+    constructor(input_size, hidden_size, { num_layers = 1, nonlinearity = 'tanh', bidirectional = false, batch_first = true } = {}) {
+        super();
+        this.input_size = input_size;
+        this.hidden_size = hidden_size;
+        this.num_layers = num_layers;
+        this.bidirectional = bidirectional;
+        this.batch_first = batch_first;
+        this.mode = nonlinearity === 'relu' ? 0 : 1; // 0=RNN_RELU, 1=RNN_TANH
+        const num_dir = bidirectional ? 2 : 1;
+        for (let l = 0; l < num_layers * num_dir; l++) {
+            const in_sz = (l < num_dir) ? input_size : hidden_size * num_dir;
+            this._parameters[`weight_ih_l${l}`] = Tensor.randn([hidden_size, in_sz]);
+            this._parameters[`weight_hh_l${l}`] = Tensor.randn([hidden_size, hidden_size]);
+            this._parameters[`bias_ih_l${l}`] = zeros([hidden_size]);
+            this._parameters[`bias_hh_l${l}`] = zeros([hidden_size]);
+        }
+    }
+    forward(x, h0 = null) {
+        if (!this.batch_first) x = x.transpose(0, 1);
+        const nl = this.num_layers * (this.bidirectional ? 2 : 1);
+        const wih = [], whh = [], bih = [], bhh = [];
+        for (let l = 0; l < nl; l++) {
+            wih.push(this._parameters[`weight_ih_l${l}`]);
+            whh.push(this._parameters[`weight_hh_l${l}`]);
+            bih.push(this._parameters[`bias_ih_l${l}`]);
+            bhh.push(this._parameters[`bias_hh_l${l}`]);
+        }
+        return Tensor.rnnForward(x, h0, null, wih, whh, bih, bhh,
+            this.mode, this.hidden_size, this.num_layers, this.bidirectional ? 1 : 0);
+    }
+}
+
+// ==================== LSTM ====================
+class LSTM extends Module {
+    constructor(input_size, hidden_size, { num_layers = 1, bidirectional = false, batch_first = true } = {}) {
+        super();
+        this.input_size = input_size;
+        this.hidden_size = hidden_size;
+        this.num_layers = num_layers;
+        this.bidirectional = bidirectional;
+        this.batch_first = batch_first;
+        const num_dir = bidirectional ? 2 : 1;
+        for (let l = 0; l < num_layers * num_dir; l++) {
+            const in_sz = (l < num_dir) ? input_size : hidden_size * num_dir;
+            this._parameters[`weight_ih_l${l}`] = Tensor.randn([4 * hidden_size, in_sz]);
+            this._parameters[`weight_hh_l${l}`] = Tensor.randn([4 * hidden_size, hidden_size]);
+            this._parameters[`bias_ih_l${l}`] = zeros([4 * hidden_size]);
+            this._parameters[`bias_hh_l${l}`] = zeros([4 * hidden_size]);
+        }
+    }
+    forward(x, h0 = null, c0 = null) {
+        if (!this.batch_first) x = x.transpose(0, 1);
+        const nl = this.num_layers * (this.bidirectional ? 2 : 1);
+        const wih = [], whh = [], bih = [], bhh = [];
+        for (let l = 0; l < nl; l++) {
+            wih.push(this._parameters[`weight_ih_l${l}`]);
+            whh.push(this._parameters[`weight_hh_l${l}`]);
+            bih.push(this._parameters[`bias_ih_l${l}`]);
+            bhh.push(this._parameters[`bias_hh_l${l}`]);
+        }
+        return Tensor.rnnForward(x, h0, c0, wih, whh, bih, bhh,
+            2, this.hidden_size, this.num_layers, this.bidirectional ? 1 : 0);
+    }
+}
+
 // ==================== GRU ====================
 class GRU extends Module {
     constructor(input_size, hidden_size, { num_layers = 1, bidirectional = false, batch_first = false } = {}) {
@@ -403,7 +470,7 @@ class GRU extends Module {
         const r = gi.slice(1, 0, hs).add(gh.slice(1, 0, hs)).sigmoid();
         const z = gi.slice(1, hs, 2*hs).add(gh.slice(1, hs, 2*hs)).sigmoid();
         const n = gi.slice(1, 2*hs, 3*hs).add(r.mul(gh.slice(1, 2*hs, 3*hs))).tanh();
-        return Tensor.ones([...z.shape]).sub(z).mul(n).add(z.mul(h));
+        return z.mul(-1).add(1).mul(n).add(z.mul(h));
     }
     
     _run_direction(input, seqLen, batch, layerIdx, suffix = '') {
@@ -412,7 +479,8 @@ class GRU extends Module {
         const whh = this._parameters[`weight_hh_l${layerIdx}${suffix}`];
         const bih = this._parameters[`bias_ih_l${layerIdx}${suffix}`];
         const bhh = this._parameters[`bias_hh_l${layerIdx}${suffix}`];
-        let h = Tensor.zeros([batch, this.hidden_size]);
+        const isGrad = (wih instanceof GradTensor) || (input instanceof GradTensor);
+        let h = isGrad ? new GradTensor(Tensor.zeros([batch, this.hidden_size]), false) : Tensor.zeros([batch, this.hidden_size]);
         const outputs = [];
         const start = reverse ? seqLen - 1 : 0;
         const end = reverse ? -1 : seqLen;
@@ -423,7 +491,10 @@ class GRU extends Module {
             if (reverse) outputs.unshift(h.unsqueeze(0));
             else outputs.push(h.unsqueeze(0));
         }
-        return { output: Tensor.cat(outputs, 0), h };
+        // h is always GradTensor after _cell (params are GradTensor), so use GradTensor.cat if available
+        const first = outputs[0];
+        const output = (first instanceof GradTensor) ? GradTensor.cat(outputs, 0) : Tensor.cat(outputs, 0);
+        return { output, h };
     }
     
     forward(x, h0 = null) {
@@ -438,7 +509,8 @@ class GRU extends Module {
             hResults.push(fwd.h.unsqueeze(0));
             if (this.bidirectional) {
                 const rev = this._run_direction(input, seqLen, batch, l, '_reverse');
-                input = Tensor.cat([fwd.output, rev.output], 2);
+                const catFn = (fwd.output instanceof GradTensor) ? GradTensor.cat : Tensor.cat;
+                input = catFn([fwd.output, rev.output], 2);
                 hResults.push(rev.h.unsqueeze(0));
             } else {
                 input = fwd.output;
@@ -446,7 +518,8 @@ class GRU extends Module {
         }
         let output = input;
         if (this.batch_first) output = output.transpose(0, 1);
-        return [output, Tensor.cat(hResults, 0)];
+        const hCat = (hResults[0] instanceof GradTensor) ? GradTensor.cat(hResults, 0) : Tensor.cat(hResults, 0);
+        return [output, hCat];
     }
 }
 
@@ -545,7 +618,7 @@ const F = {
 export const nn = {
     Module, Linear, Embedding,
     Conv1d, ConvTranspose1d, Conv2d, ConvTranspose2d,
-    AvgPool2d, MaxPool2d, Upsample, GRU,
+    AvgPool2d, MaxPool2d, Upsample, RNN, LSTM, GRU,
     LayerNorm, GroupNorm, BatchNorm1d, BatchNorm2d,
     ReLU, LeakyReLU, Sigmoid, Tanh, GELU, SiLU, Dropout,
     Sequential, ModuleList,

@@ -138,7 +138,23 @@ public:
     static void conv2d_backward_cudnn(const Tensor& input, const Tensor& weight, const Tensor& grad_output,
                                        Tensor& grad_input, Tensor& grad_weight, Tensor* grad_bias,
                                        int sH, int sW, int pH, int pW, int dH, int dW, int groups);
-    
+
+    // cuDNN RNN forward/backward
+    // mode: 0=RNN_RELU, 1=RNN_TANH, 2=LSTM, 3=GRU
+    // x: [B, seq_len, input_size], hx: [num_layers*num_dir, B, hidden], cx: same (LSTM only)
+    // Returns: {y, hy} or {y, hy, cy} for LSTM
+    static std::vector<Tensor> rnn_forward(const Tensor& x, const Tensor* hx, const Tensor* cx,
+                                            const std::vector<Tensor>& weights_ih, const std::vector<Tensor>& weights_hh,
+                                            const std::vector<Tensor>& biases_ih, const std::vector<Tensor>& biases_hh,
+                                            int mode, int hidden_size, int num_layers, int bidirectional);
+
+    // Returns: {dx, dhx, [dcx], dw_ih[0], dw_hh[0], db_ih[0], db_hh[0], ...}
+    static std::vector<Tensor> rnn_backward(const Tensor& x, const Tensor* hx, const Tensor* cx,
+                                             const Tensor& y, const Tensor& dy, const Tensor* dhy, const Tensor* dcy,
+                                             const std::vector<Tensor>& weights_ih, const std::vector<Tensor>& weights_hh,
+                                             const std::vector<Tensor>& biases_ih, const std::vector<Tensor>& biases_hh,
+                                             int mode, int hidden_size, int num_layers, int bidirectional);
+
     Tensor interpolate(int target_size, int mode, bool align_corners = false) const;
     
     // Backward ops
