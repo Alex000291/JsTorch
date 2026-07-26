@@ -13,9 +13,9 @@ native/audio/       → STFT (cuFFT)
 build/win/          → output .node + bundled DLLs
 ```
 
-Data flow: `JS GradTensor → N-API → C++ Tensor → CUDA kernel`
-Memory: `CudaAllocator` (sub-allocation, free-list, coalescing, 256MB segments)
-Autograd: **dual implementation** — JS (src/autograd.js) and C++ (native/core/autograd.hpp)
+Data flow: `C++ GradTensor → CUDA kernel` (1 N-API call per JS method, backward stays in C++)
+Memory: `CudaAllocator` (size-binned O(1) alloc/free, 256MB segments, no mutex)
+Autograd: **C++ only** — `native/core/autograd.hpp` (JS autograd deleted)
 
 ---
 
@@ -108,8 +108,8 @@ class Tensor
 - Binary: `#define BINARY(name,launcher)` macro → broadcast shape + contiguous + alloc + launch
 - Reduce: flatten to (outer, reduce_dim, inner), launch reduce kernel
 - Matmul: `cublasSgemm` (col-major trick: C^T = B^T * A^T → row-major C = A * B)
-- Conv2d fwd: `cudnnConvolutionForward` with plan cache (`map<ConvParams, ConvPlan>`)
-- Conv bwd: im2col + cuBLAS gemm
+- Conv2d fwd/bwd: cuDNN with fully cached descriptors + algorithms (`map<ConvParams, CudnnFwdCached/CudnnBwdCached>`)
+- Conv1d fwd/bwd: im2col + cuBLAS gemm
 
 ### `autograd.hpp` — C++ autograd engine
 ```
@@ -317,13 +317,17 @@ class GradTensorWrap : ObjectWrap<GradTensorWrap>
   static Wrap(env, GradPtr) → Napi::Object
   static Extract(Napi::Value) → GradPtr
 
-  // Accessors: shape, ndim, requires_grad (r/w), toArray, getData, detach
+  // Accessors: shape, ndim, requires_grad (r/w), data (r/w), grad (r/w), toArray, detach
   // Backward: backward(upstream?), getGrad, setGrad, clearGrad
   // View: reshape/transpose/squeeze/unsqueeze/clone/contiguous/flatten/slice
-  // Unary: GRAD_UNARY macro → delegates to autograd.hpp methods
+  // Unary: GRAD_UNARY macro + leaky_relu/clamp/clamp_min/clamp_max/fmod
   // Binary: Add/Sub/Mul/Div/Pow (scalar→*_scalar_, tensor→*_())
-  //         Gt/Lt/Ge/Le/Eq/Ne
-  // Matmul/Reduce/Conv2d/AvgPool2d
+  //         Gt/Lt/Ge/Le/Eq/Ne/Maximum/Minimum
+  // Matmul/Reduce (sum/mean/max/min)
+  // Conv: conv2d/conv1d/conv_transpose1d/conv_transpose2d/avg_pool2d/max_pool2d
+  // Misc: embedding/flip/pad/interpolate/cumsum
+  // Static: cat/randn/zeros/ones/full/fromBuffer/fromTensor/adamStep/adamStepMulti
+  // Extract(): accepts both GradTensor and raw Tensor args (auto-wraps Tensor)
   // Static: randn/zeros/ones/full/fromBuffer/fromTensor
   // Adam: adamStep (single), adamStepMulti (batch all params, 1 N-API call)
 
@@ -356,40 +360,10 @@ class Tensor extends native.Tensor
 // Standalone: tril(input,diag) / triu(input,diag) — via arange+mask+where
 ```
 
-### `autograd.js` — JS autograd (LEGACY, being replaced by C++ autograd.hpp)
-```
-// Grad context
-no_grad(fn) / enable_grad(fn) / is_grad_enabled() / set_grad_enabled(bool)
-
-class GradTensor
-  data: native.Tensor
-  requires_grad: bool
-  grad: native.Tensor | null
-  grad_fn: (grad) => [grad_for_parent, ...]
-  _parents: GradTensor[]
-
-  backward(upstream?)    // JS topo sort + reverse traverse (N-API per op!)
-
-  // View ops: reshape/view/squeeze/unsqueeze/transpose/contiguous/flatten/slice/expand/permute/split/chunk
-  // Static: zeros/ones/randn/rand/full/arange/linspace/fromBuffer/fromFlat/fromIntArray
-  //         cat/stack/where/zeros_like/ones_like
-
-// Backward registry B = {}
-  // Unary: neg/abs/exp/log/log1p/sqrt/square/sin/cos/sigmoid/tanh/relu/silu/gelu/softplus/reciprocal/sign
-  //        leaky_relu/clamp/clamp_min/clamp_max/fmod/pow_scalar/mul_scalar/add_scalar
-  // Binary: add/sub/mul/div/pow/maximum/minimum/gt/lt/ge/le/eq/ne
-  // Matmul: da = g@b^T, db = a^T@g
-  // Reduce: sum/mean (expand grad back), max/min (one-hot mask)
-  // Conv: conv1d/conv_transpose1d/conv2d/conv_transpose2d/avg_pool2d/interpolate
-  // Misc: pad/cumsum/flip/embedding
-
-// Methods generated via metaprogramming loops:
-  SIMPLE_UNARY (17 ops) — prototype[op] = fn
-  BINARY_OPS (13 ops) — handles scalar + tensor, unbroadcast
-  Reduce ops: sum/mean/max/min/argmax/argmin
-  Conv ops: conv1d/conv_transpose1d/conv2d/conv_transpose2d/avg_pool2d/interpolate
-  Misc: flip/pad/cumsum/embedding
-```
+### `autograd.js` — DELETED
+JS autograd has been removed. All autograd is now in C++ (`native/core/autograd.hpp`).
+`GradTensor` is exported directly from native module via `native.GradTensor`.
+`no_grad`/`enable_grad`/`is_grad_enabled`/`set_grad_enabled` are no-op shims in `index.js`.
 
 ### `nn.js` — neural network modules
 ```
@@ -464,6 +438,15 @@ MSVC_PATH = C:\...\VS 2022 Community
 - **UNARY/BINARY macros**: `tensor.cpp` reduces boilerplate for 30+ ops
 - **Conv2d forward**: cuDNN with algorithm cache; backward: im2col + cuBLAS
 - **powf(negative)**: explicit sign handling to avoid NaN
-- **Two autograd systems**: JS (src/autograd.js) — full featured but slow (N-API per op in backward); C++ (native/core/autograd.hpp) — fast (backward stays in C++, 1 N-API call)
-- **CompiledGraph**: declarative graph builder → forward+backward+Adam in single N-API call. Eliminates ALL JS↔C++ overhead for training. MLP train B=32: 403us (beats PyTorch 671us)
+- **C++ autograd only**: JS autograd deleted. All backward stays in C++ (zero N-API overhead per op during backward). GradTensor exposed via `.data`/`.grad` property accessors for optim.js compatibility.
+- **cuDNN descriptor caching**: Both forward and backward descriptors are fully cached (key: ConvParams). First call is cold (~100ms), subsequent calls are O(1) lookup.
+- **O(1) allocator**: Size-binned free lists (no mutex). Training loops allocate same sizes → ~100% cache hit rate.
+- **CompiledGraph**: declarative graph builder → forward+backward+Adam in single N-API call. Optional `torch.compile` equivalent. MLP train B=32: 86us.
+- **Benchmark results (warm, B=32)**:
+  - MLP: JsTorch 371us vs PyTorch 714us = **1.9x faster**
+  - LeNet: JsTorch 738us vs PyTorch 1152us = **1.6x faster**
+  - RNN: JsTorch 701us vs PyTorch 809us = **1.2x faster**
+  - GRU: JsTorch 713us vs PyTorch 1874us = **2.6x faster**
+  - LSTM: JsTorch 781us vs PyTorch 1928us = **2.5x faster**
+  - MLP compiled: 86us vs PyTorch 714us = **8.3x faster**
 - **randn is slow** (~3ms for [512,784]): curand_normal per-element kernel. fromBuffer is 116us. Benchmark should avoid randn in hot loop.

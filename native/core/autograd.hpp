@@ -269,6 +269,56 @@ public:
         }, {shared_from_this()});
     }
 
+    GradPtr leaky_relu_(float slope = 0.01f) {
+        Tensor out = data.leaky_relu(slope);
+        if (!requires_grad) return make(std::move(out));
+        Tensor sx = data;
+        return make_with_grad(std::move(out),
+            [sx, slope](const Tensor& g) {
+                Tensor mask = sx.gt(Tensor::full(sx.shape(), 0.f));
+                Tensor slope_mask = sx.le(Tensor::full(sx.shape(), 0.f)).mul_scalar(slope);
+                return std::vector<Tensor>{g.mul(mask.add(slope_mask))};
+            }, {shared_from_this()});
+    }
+
+    GradPtr clamp_(float lo, float hi) {
+        Tensor out = data.clamp(lo, hi);
+        if (!requires_grad) return make(std::move(out));
+        Tensor sx = data;
+        return make_with_grad(std::move(out),
+            [sx, lo, hi](const Tensor& g) {
+                return std::vector<Tensor>{g.mul(sx.ge(Tensor::full(sx.shape(), lo)).mul(sx.le(Tensor::full(sx.shape(), hi))))};
+            }, {shared_from_this()});
+    }
+
+    GradPtr clamp_min_(float lo) {
+        Tensor out = data.clamp_min(lo);
+        if (!requires_grad) return make(std::move(out));
+        Tensor sx = data;
+        return make_with_grad(std::move(out),
+            [sx, lo](const Tensor& g) {
+                return std::vector<Tensor>{g.mul(sx.ge(Tensor::full(sx.shape(), lo)))};
+            }, {shared_from_this()});
+    }
+
+    GradPtr clamp_max_(float hi) {
+        Tensor out = data.clamp_max(hi);
+        if (!requires_grad) return make(std::move(out));
+        Tensor sx = data;
+        return make_with_grad(std::move(out),
+            [sx, hi](const Tensor& g) {
+                return std::vector<Tensor>{g.mul(sx.le(Tensor::full(sx.shape(), hi)))};
+            }, {shared_from_this()});
+    }
+
+    GradPtr fmod_(float d) {
+        Tensor out = data.fmod(d);
+        if (!requires_grad) return make(std::move(out));
+        return make_with_grad(std::move(out),
+            [](const Tensor& g) { return std::vector<Tensor>{g}; },
+            {shared_from_this()});
+    }
+
     // --- Binary ops (unbroadcast is public for tape backward) ---
     public:
     static Tensor unbroadcast(const Tensor& grad, const Shape& target) {
@@ -350,6 +400,34 @@ public:
     GradPtr le_(GradPtr other) { return make(data.le(other->data)); }
     GradPtr eq_(GradPtr other) { return make(data.eq(other->data)); }
     GradPtr ne_(GradPtr other) { return make(data.ne(other->data)); }
+
+    GradPtr maximum_(GradPtr other) {
+        Tensor out = data.maximum(other->data);
+        if (!requires_grad && !other->requires_grad) return make(std::move(out));
+        Tensor a = data, b = other->data;
+        Shape sa = a.shape(), sb = b.shape();
+        return make_with_grad(std::move(out),
+            [a, b, sa, sb](const Tensor& g) {
+                return std::vector<Tensor>{
+                    unbroadcast(g.mul(a.ge(b)), sa),
+                    unbroadcast(g.mul(b.gt(a)), sb)
+                };
+            }, {shared_from_this(), other});
+    }
+
+    GradPtr minimum_(GradPtr other) {
+        Tensor out = data.minimum(other->data);
+        if (!requires_grad && !other->requires_grad) return make(std::move(out));
+        Tensor a = data, b = other->data;
+        Shape sa = a.shape(), sb = b.shape();
+        return make_with_grad(std::move(out),
+            [a, b, sa, sb](const Tensor& g) {
+                return std::vector<Tensor>{
+                    unbroadcast(g.mul(a.le(b)), sa),
+                    unbroadcast(g.mul(b.lt(a)), sb)
+                };
+            }, {shared_from_this(), other});
+    }
 
     // --- Matmul ---
     GradPtr matmul_(GradPtr other) {
@@ -512,6 +590,255 @@ public:
             }, {shared_from_this()});
     }
 
+    // --- Conv1d ---
+    GradPtr conv1d_(GradPtr weight, GradPtr bias,
+                    int stride, int padding, int dilation, int groups) {
+        const Tensor* b_ptr = bias ? &bias->data : nullptr;
+        Tensor out = data.conv1d(weight->data, b_ptr, stride, padding, dilation, groups);
+        bool need = requires_grad || weight->requires_grad || (bias && bias->requires_grad);
+        if (!need) return make(std::move(out));
+        Tensor saved_x = data, saved_w = weight->data;
+        Shape x_shape = data.shape(), w_shape = weight->data.shape();
+        bool has_bias = (bias != nullptr);
+        auto self = shared_from_this();
+        std::vector<GradPtr> par = {self, weight};
+        if (bias) par.push_back(bias);
+        return make_with_grad(std::move(out),
+            [saved_x, saved_w, x_shape, w_shape, stride, padding, dilation, groups, has_bias](const Tensor& g) {
+                Tensor dx = g.conv_transpose1d(saved_w, nullptr, stride, padding, 0, dilation, groups);
+                int Ci_g = w_shape[1], K = w_shape[2];
+                Tensor dw = Tensor::conv1d_backward_weight(saved_x, g, Ci_g, K, stride, padding, dilation, groups);
+                if (has_bias) {
+                    Tensor db = g.sum(0, false).sum(-1, false);
+                    return std::vector<Tensor>{dx, dw, db};
+                }
+                return std::vector<Tensor>{dx, dw};
+            }, par);
+    }
+
+    // --- ConvTranspose1d ---
+    GradPtr conv_transpose1d_(GradPtr weight, GradPtr bias,
+                               int stride, int padding, int output_padding, int dilation, int groups) {
+        const Tensor* b_ptr = bias ? &bias->data : nullptr;
+        Tensor out = data.conv_transpose1d(weight->data, b_ptr, stride, padding, output_padding, dilation, groups);
+        bool need = requires_grad || weight->requires_grad || (bias && bias->requires_grad);
+        if (!need) return make(std::move(out));
+        Tensor saved_x = data, saved_w = weight->data;
+        Shape x_shape = data.shape(), w_shape = weight->data.shape();
+        bool has_bias = (bias != nullptr);
+        auto self = shared_from_this();
+        std::vector<GradPtr> par = {self, weight};
+        if (bias) par.push_back(bias);
+        return make_with_grad(std::move(out),
+            [saved_x, saved_w, x_shape, w_shape, stride, padding, dilation, groups, has_bias](const Tensor& g) {
+                Tensor dx = g.conv1d(saved_w, nullptr, stride, padding, dilation, groups);
+                int Co_g = w_shape[1], K = w_shape[2];
+                Tensor dw = Tensor::conv_transpose1d_backward_weight(saved_x, g, Co_g, K, stride, padding, dilation, groups);
+                if (has_bias) {
+                    Tensor db = g.sum(0, false).sum(-1, false);
+                    return std::vector<Tensor>{dx, dw, db};
+                }
+                return std::vector<Tensor>{dx, dw};
+            }, par);
+    }
+
+    // --- ConvTranspose2d ---
+    GradPtr conv_transpose2d_(GradPtr weight, GradPtr bias,
+                               int sH, int sW, int pH, int pW, int opH, int opW,
+                               int dH, int dW, int groups) {
+        const Tensor* b_ptr = bias ? &bias->data : nullptr;
+        Tensor out = data.conv_transpose2d(weight->data, b_ptr, sH, sW, pH, pW, opH, opW, dH, dW, groups);
+        bool need = requires_grad || weight->requires_grad || (bias && bias->requires_grad);
+        if (!need) return make(std::move(out));
+        Tensor saved_x = data, saved_w = weight->data;
+        Shape x_shape = data.shape(), w_shape = weight->data.shape();
+        bool has_bias = (bias != nullptr);
+        auto self = shared_from_this();
+        std::vector<GradPtr> par = {self, weight};
+        if (bias) par.push_back(bias);
+        return make_with_grad(std::move(out),
+            [saved_x, saved_w, x_shape, w_shape, sH, sW, pH, pW, dH, dW, groups, has_bias](const Tensor& g) {
+                Tensor dx = g.conv2d(saved_w, nullptr, sH, sW, pH, pW, dH, dW, groups);
+                int Co_g = w_shape[1], kH = w_shape[2], kW = w_shape[3];
+                Tensor dw = Tensor::conv_transpose2d_backward_weight(saved_x, g, Co_g, kH, kW, sH, sW, pH, pW, dH, dW, groups);
+                if (has_bias) {
+                    Tensor db = g.sum(0, false).sum(-1, false).sum(-1, false);
+                    return std::vector<Tensor>{dx, dw, db};
+                }
+                return std::vector<Tensor>{dx, dw};
+            }, par);
+    }
+
+    // --- Embedding ---
+    GradPtr embedding_(const Tensor& indices) {
+        Tensor out = data.embedding(indices);
+        if (!requires_grad) return make(std::move(out));
+        int vocab = data.shape()[0];
+        auto idx = std::make_shared<Tensor>(indices);
+        return make_with_grad(std::move(out),
+            [idx, vocab](const Tensor& g) {
+                return std::vector<Tensor>{g.scatter_add(g, *idx, vocab)};
+            }, {shared_from_this()});
+    }
+
+    // --- Flip ---
+    GradPtr flip_(int dim) {
+        Tensor out = data.flip(dim);
+        if (!requires_grad) return make(std::move(out));
+        return make_with_grad(std::move(out),
+            [dim](const Tensor& g) { return std::vector<Tensor>{g.flip(dim)}; },
+            {shared_from_this()});
+    }
+
+    // --- Pad ---
+    GradPtr pad_(const std::vector<int>& padding, int mode = 0, float value = 0.0f) {
+        Tensor out = data.pad(padding, mode, value);
+        if (!requires_grad) return make(std::move(out));
+        Shape orig = data.shape();
+        auto pad_copy = padding;
+        return make_with_grad(std::move(out),
+            [orig, pad_copy](const Tensor& g) {
+                Tensor dx = g;
+                int nd = (int)orig.size();
+                for (int i = 0; i < (int)pad_copy.size(); i += 2) {
+                    int dim = nd - 1 - i / 2;
+                    int left = pad_copy[i];
+                    int orig_size = orig[dim];
+                    dx = dx.slice(dim, left, left + orig_size);
+                }
+                return std::vector<Tensor>{dx.contiguous()};
+            }, {shared_from_this()});
+    }
+
+    // --- Interpolate ---
+    GradPtr interpolate_(int target, int mode, bool align = false) {
+        Tensor out = data.interpolate(target, mode, align);
+        if (!requires_grad) return make(std::move(out));
+        int in_len = data.shape().back();
+        return make_with_grad(std::move(out),
+            [in_len, mode, align](const Tensor& g) {
+                return std::vector<Tensor>{g.interp1d_backward(in_len, mode, align)};
+            }, {shared_from_this()});
+    }
+
+    // --- Cumsum ---
+    GradPtr cumsum_(int dim) {
+        Tensor out = data.cumsum(dim);
+        if (!requires_grad) return make(std::move(out));
+        return make_with_grad(std::move(out),
+            [dim](const Tensor& g) {
+                return std::vector<Tensor>{g.flip(dim).cumsum(dim).flip(dim)};
+            }, {shared_from_this()});
+    }
+
+    // --- Unsqueeze ---
+    GradPtr unsqueeze_(int dim) {
+        Tensor out = data.unsqueeze(dim);
+        if (!requires_grad) return make(std::move(out));
+        Shape orig = data.shape();
+        return make_with_grad(std::move(out),
+            [orig](const Tensor& g) { return std::vector<Tensor>{g.reshape(orig)}; },
+            {shared_from_this()});
+    }
+
+    // --- Flatten ---
+    GradPtr flatten_(int start_dim = 0, int end_dim = -1) {
+        Tensor out = data.flatten(start_dim, end_dim);
+        if (!requires_grad) return make(std::move(out));
+        Shape orig = data.shape();
+        return make_with_grad(std::move(out),
+            [orig](const Tensor& g) { return std::vector<Tensor>{g.reshape(orig)}; },
+            {shared_from_this()});
+    }
+
+    // --- Contiguous ---
+    GradPtr contiguous_() {
+        Tensor out = data.contiguous();
+        if (!requires_grad) return make(std::move(out));
+        return make_with_grad(std::move(out),
+            [](const Tensor& g) { return std::vector<Tensor>{g}; },
+            {shared_from_this()});
+    }
+
+    // --- Clone ---
+    GradPtr clone_() {
+        Tensor out = data.clone();
+        if (!requires_grad) return make(std::move(out));
+        return make_with_grad(std::move(out),
+            [](const Tensor& g) { return std::vector<Tensor>{g}; },
+            {shared_from_this()});
+    }
+
+    // --- Max reduce ---
+    GradPtr max_(int dim, bool keepdim = false) {
+        Tensor out = data.max(dim, keepdim);
+        if (!requires_grad) return make(std::move(out));
+        Tensor sx = data;
+        Tensor sout = out;
+        return make_with_grad(std::move(out),
+            [sx, sout, dim, keepdim](const Tensor& g) {
+                Tensor g_expand = g;
+                Tensor o_expand = sout;
+                if (!keepdim) {
+                    Shape s = sx.shape(); s[dim] = 1;
+                    g_expand = g.reshape(s);
+                    o_expand = sout.reshape(s);
+                }
+                Tensor mask = sx.eq(o_expand.add(Tensor::full(sx.shape(), 0.f)));
+                return std::vector<Tensor>{g_expand.mul(mask)};
+            }, {shared_from_this()});
+    }
+
+    // --- Min reduce ---
+    GradPtr min_(int dim, bool keepdim = false) {
+        Tensor out = data.min(dim, keepdim);
+        if (!requires_grad) return make(std::move(out));
+        Tensor sx = data;
+        Tensor sout = out;
+        return make_with_grad(std::move(out),
+            [sx, sout, dim, keepdim](const Tensor& g) {
+                Tensor g_expand = g;
+                Tensor o_expand = sout;
+                if (!keepdim) {
+                    Shape s = sx.shape(); s[dim] = 1;
+                    g_expand = g.reshape(s);
+                    o_expand = sout.reshape(s);
+                }
+                Tensor mask = sx.eq(o_expand.add(Tensor::full(sx.shape(), 0.f)));
+                return std::vector<Tensor>{g_expand.mul(mask)};
+            }, {shared_from_this()});
+    }
+
+    // --- Static cat ---
+    static GradPtr cat_(const std::vector<GradPtr>& tensors, int dim) {
+        std::vector<Tensor> data_vec;
+        for (auto& t : tensors) data_vec.push_back(t->data);
+        Tensor out = Tensor::cat(data_vec, dim);
+
+        bool need = false;
+        for (auto& t : tensors) if (t->requires_grad) { need = true; break; }
+        if (!need) return make(std::move(out));
+
+        std::vector<int> sizes;
+        for (auto& t : tensors) {
+            int d = dim < 0 ? dim + t->ndim() : dim;
+            sizes.push_back(t->data.shape()[d]);
+        }
+
+        std::vector<GradPtr> parents(tensors.begin(), tensors.end());
+        return make_with_grad(std::move(out),
+            [sizes, dim](const Tensor& g) {
+                std::vector<Tensor> grads;
+                int offset = 0;
+                int d = dim < 0 ? dim + g.ndim() : dim;
+                for (int s : sizes) {
+                    grads.push_back(g.slice(d, offset, offset + s).contiguous());
+                    offset += s;
+                }
+                return grads;
+            }, parents);
+    }
+
 private:
     static void topo_sort(GradTensor* node, std::vector<GradTensor*>& order,
                           std::unordered_set<GradTensor*>& visited) {
@@ -542,6 +869,8 @@ enum class OpType : uint8_t {
     TRANSPOSE, TRANSPOSE2, RESHAPE,
     // CNN
     CONV2D, MAX_POOL2D, AVG_POOL2D, BATCH_NORM2D, FLATTEN,
+    // Misc
+    CAT, SLICE, UNSQUEEZE, SQUEEZE,
     // Loop
     LOOP_BEGIN, LOOP_SLICE, LOOP_END,
     // Fused RNN (cuDNN)
@@ -712,6 +1041,31 @@ public:
         return o;
     }
 
+    // Cat: concatenate multiple slots along dim. slots stored in iparams, count in fparam
+    int cat(const std::vector<int>& inputs, int dim) {
+        int o = alloc();
+        TracedOp op{OpType::CAT, (int16_t)o, -1, -1, -1, -1, (float)dim, {}};
+        for (int i = 0; i < (int)inputs.size() && i < 8; i++) op.iparams[i] = inputs[i];
+        // Store count in in0
+        op.in0 = (int16_t)inputs.size();
+        ops_.push_back(op);
+        return o;
+    }
+    // Slice: input[dim, start:end]
+    int slice(int input, int dim, int start, int end) {
+        int o = alloc();
+        TracedOp op{OpType::SLICE, (int16_t)o, (int16_t)input, -1, -1, -1, 0, {}};
+        op.iparams[0] = dim; op.iparams[1] = start; op.iparams[2] = end;
+        ops_.push_back(op);
+        return o;
+    }
+    int unsqueeze(int input, int dim) {
+        return op1(OpType::UNSQUEEZE, input, 0, dim);
+    }
+    int squeeze(int input, int dim) {
+        return op1(OpType::SQUEEZE, input, 0, dim);
+    }
+
     // RNN_CUDNN: returns {y_slot, hy_slot, cy_slot}
     std::vector<int> rnn_cudnn(int x_slot, int hx_slot, int cx_slot,
                                const std::vector<int>& wih, const std::vector<int>& whh,
@@ -819,6 +1173,24 @@ public:
                     slots[op.out] = a->reshape_(ns);
                     break;
                 }
+                // Misc
+                case OpType::CAT: {
+                    int count = op.in0;
+                    std::vector<GradPtr> tensors;
+                    for (int i = 0; i < count; i++) tensors.push_back(slots[op.iparams[i]]);
+                    int dim = (int)op.fparam;
+                    slots[op.out] = GradTensor::cat_(tensors, dim);
+                    break;
+                }
+                case OpType::SLICE:
+                    slots[op.out] = a->slice_(op.iparams[0], op.iparams[1], op.iparams[2]);
+                    break;
+                case OpType::UNSQUEEZE:
+                    slots[op.out] = a->unsqueeze_(op.iparams[0]);
+                    break;
+                case OpType::SQUEEZE:
+                    slots[op.out] = a->squeeze_(op.iparams[0]);
+                    break;
                 // CNN
                 case OpType::CONV2D: {
                     auto bias = op.in2 >= 0 ? slots[op.in2] : nullptr;
@@ -923,7 +1295,24 @@ public:
                                         lop.iparams[4], lop.iparams[5], lop.iparams[6]);
                                     break;
                                 }
-                                default: break;  // Other ops shouldn't appear in loops typically
+                                case OpType::CAT: {
+                                    int count = lop.in0;
+                                    std::vector<GradPtr> tensors;
+                                    for (int i = 0; i < count; i++) tensors.push_back(slots[lop.iparams[i]]);
+                                    int dim = (int)lop.fparam;
+                                    slots[lop.out] = GradTensor::cat_(tensors, dim);
+                                    break;
+                                }
+                                case OpType::SLICE:
+                                    slots[lop.out] = la->slice_(lop.iparams[0], lop.iparams[1], lop.iparams[2]);
+                                    break;
+                                case OpType::UNSQUEEZE:
+                                    slots[lop.out] = la->unsqueeze_(lop.iparams[0]);
+                                    break;
+                                case OpType::SQUEEZE:
+                                    slots[lop.out] = la->squeeze_(lop.iparams[0]);
+                                    break;
+                                default: break;
                             }
                         }
                         // Apply carry: copy from→to slots

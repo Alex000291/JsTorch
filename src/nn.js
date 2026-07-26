@@ -1,6 +1,7 @@
 // nn.js - Neural network modules for RVC
 import { Tensor, zeros, ones } from './tensor.js';
-import { GradTensor } from './autograd.js';
+import native from './native.js';
+const GradTensor = native.GradTensor;
 
 // ==================== #27 Module base ====================
 class Module {

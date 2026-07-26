@@ -731,9 +731,17 @@ public:
         return obj;
     }
 
-    // Extract GradPtr from JS value
+    // Extract GradPtr from JS value — accepts both GradTensor and raw Tensor
     static GradPtr Extract(Napi::Value v) {
-        return Napi::ObjectWrap<GradTensorWrap>::Unwrap(v.As<Napi::Object>())->gt_;
+        auto obj = v.As<Napi::Object>();
+        auto* refs = v.Env().GetInstanceData<CtorRefs>();
+        // Check if it's a GradTensor instance
+        if (obj.InstanceOf(refs->grad_ctor.Value())) {
+            return Napi::ObjectWrap<GradTensorWrap>::Unwrap(obj)->gt_;
+        }
+        // Fallback: raw Tensor → wrap as non-grad GradTensor
+        auto* tw = Napi::ObjectWrap<TensorWrap>::Unwrap(obj);
+        return GradTensor::make(tw->tensor_, false);
     }
 
     static Napi::Object Init(Napi::Env env, Napi::Object exports) {
@@ -741,6 +749,8 @@ public:
             InstanceAccessor("shape", &GradTensorWrap::GetShape, nullptr),
             InstanceAccessor("ndim", &GradTensorWrap::GetNdim, nullptr),
             InstanceAccessor("requires_grad", &GradTensorWrap::GetRequiresGrad, &GradTensorWrap::SetRequiresGrad),
+            InstanceAccessor("data", &GradTensorWrap::GetData, &GradTensorWrap::SetData),
+            InstanceAccessor("grad", &GradTensorWrap::GetGradProp, &GradTensorWrap::SetGradProp),
 
             InstanceMethod("toArray", &GradTensorWrap::ToArray),
             InstanceMethod("backward", &GradTensorWrap::Backward),
@@ -806,8 +816,32 @@ public:
             InstanceMethod("conv2d", &GradTensorWrap::Conv2d),
             InstanceMethod("avg_pool2d", &GradTensorWrap::AvgPool2d),
             InstanceMethod("max_pool2d", &GradTensorWrap::MaxPool2d),
+            InstanceMethod("conv1d", &GradTensorWrap::Conv1d),
+            InstanceMethod("conv_transpose1d", &GradTensorWrap::ConvTranspose1d),
+            InstanceMethod("conv_transpose2d", &GradTensorWrap::ConvTranspose2d),
+
+            // Parameterized unary
+            InstanceMethod("leaky_relu", &GradTensorWrap::LeakyRelu),
+            InstanceMethod("clamp", &GradTensorWrap::Clamp),
+            InstanceMethod("clamp_min", &GradTensorWrap::ClampMin),
+            InstanceMethod("clamp_max", &GradTensorWrap::ClampMax),
+            InstanceMethod("fmod", &GradTensorWrap::Fmod),
+
+            // Binary
+            InstanceMethod("maximum", &GradTensorWrap::Maximum),
+            InstanceMethod("minimum", &GradTensorWrap::Minimum),
+
+            // Misc ops
+            InstanceMethod("embedding", &GradTensorWrap::Embedding),
+            InstanceMethod("flip", &GradTensorWrap::Flip),
+            InstanceMethod("pad", &GradTensorWrap::Pad),
+            InstanceMethod("interpolate", &GradTensorWrap::Interpolate),
+            InstanceMethod("cumsum", &GradTensorWrap::Cumsum),
+            InstanceMethod("max", &GradTensorWrap::Max),
+            InstanceMethod("min", &GradTensorWrap::Min),
 
             // Static
+            StaticMethod("cat", &GradTensorWrap::CatGrad),
             StaticMethod("randn", &GradTensorWrap::Randn),
             StaticMethod("zeros", &GradTensorWrap::Zeros),
             StaticMethod("ones", &GradTensorWrap::Ones),
@@ -826,7 +860,14 @@ public:
 
     GradTensorWrap(const Napi::CallbackInfo& info)
         : Napi::ObjectWrap<GradTensorWrap>(info) {
-        gt_ = GradTensor::make(Tensor({1}));
+        if (info.Length() >= 1 && info[0].IsObject()) {
+            // new GradTensor(tensor, requires_grad?)
+            auto* tw = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+            bool rg = (info.Length() > 1 && info[1].IsBoolean()) ? info[1].As<Napi::Boolean>().Value() : false;
+            gt_ = GradTensor::make(tw->tensor_, rg);
+        } else {
+            gt_ = GradTensor::make(Tensor({1}));
+        }
     }
 
     // ==================== Accessors ====================
@@ -851,6 +892,22 @@ public:
     }
     Napi::Value GetData(const Napi::CallbackInfo& info) {
         return TensorWrap::Wrap(info.Env(), gt_->data);
+    }
+    void SetData(const Napi::CallbackInfo& info, const Napi::Value& val) {
+        gt_->data = Napi::ObjectWrap<TensorWrap>::Unwrap(val.As<Napi::Object>())->tensor_;
+    }
+    Napi::Value GetGradProp(const Napi::CallbackInfo& info) {
+        if (!gt_->has_grad) return info.Env().Null();
+        return TensorWrap::Wrap(info.Env(), *gt_->grad_);
+    }
+    void SetGradProp(const Napi::CallbackInfo& info, const Napi::Value& val) {
+        if (val.IsNull() || val.IsUndefined()) {
+            gt_->has_grad = false;
+        } else {
+            gt_->grad_ = std::make_shared<Tensor>(
+                Napi::ObjectWrap<TensorWrap>::Unwrap(val.As<Napi::Object>())->tensor_);
+            gt_->has_grad = true;
+        }
     }
     Napi::Value Detach(const Napi::CallbackInfo& info) {
         return Wrap(info.Env(), GradTensor::make(gt_->data, false));
@@ -904,27 +961,13 @@ public:
             {gt_}));
     }
     Napi::Value Unsqueeze(const Napi::CallbackInfo& info) {
-        int dim = info[0].As<Napi::Number>().Int32Value();
-        Tensor out = gt_->data.unsqueeze(dim);
-        if (!gt_->requires_grad) return Wrap(info.Env(), GradTensor::make(std::move(out)));
-        Shape orig = gt_->shape();
-        return Wrap(info.Env(), GradTensor::make_with_grad(std::move(out),
-            [orig](const Tensor& g) { return std::vector<Tensor>{g.reshape(orig)}; },
-            {gt_}));
+        return Wrap(info.Env(), gt_->unsqueeze_(info[0].As<Napi::Number>().Int32Value()));
     }
     Napi::Value Clone(const Napi::CallbackInfo& info) {
-        Tensor out = gt_->data.clone();
-        if (!gt_->requires_grad) return Wrap(info.Env(), GradTensor::make(std::move(out)));
-        return Wrap(info.Env(), GradTensor::make_with_grad(std::move(out),
-            [](const Tensor& g) { return std::vector<Tensor>{g.clone()}; },
-            {gt_}));
+        return Wrap(info.Env(), gt_->clone_());
     }
     Napi::Value Contiguous(const Napi::CallbackInfo& info) {
-        Tensor out = gt_->data.contiguous();
-        if (!gt_->requires_grad) return Wrap(info.Env(), GradTensor::make(std::move(out)));
-        return Wrap(info.Env(), GradTensor::make_with_grad(std::move(out),
-            [](const Tensor& g) { return std::vector<Tensor>{g}; },
-            {gt_}));
+        return Wrap(info.Env(), gt_->contiguous_());
     }
     Napi::Value Flatten(const Napi::CallbackInfo& info) {
         int s = info[0].As<Napi::Number>().Int32Value();
@@ -1069,6 +1112,122 @@ public:
         return Wrap(info.Env(), gt_->max_pool2d_(kH, kW, sH, sW, pH, pW));
     }
 
+    // ==================== New parameterized unary ====================
+    Napi::Value LeakyRelu(const Napi::CallbackInfo& info) {
+        float slope = info.Length() > 0 ? info[0].As<Napi::Number>().FloatValue() : 0.01f;
+        return Wrap(info.Env(), gt_->leaky_relu_(slope));
+    }
+    Napi::Value Clamp(const Napi::CallbackInfo& info) {
+        float lo = info[0].As<Napi::Number>().FloatValue();
+        float hi = info[1].As<Napi::Number>().FloatValue();
+        return Wrap(info.Env(), gt_->clamp_(lo, hi));
+    }
+    Napi::Value ClampMin(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), gt_->clamp_min_(info[0].As<Napi::Number>().FloatValue()));
+    }
+    Napi::Value ClampMax(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), gt_->clamp_max_(info[0].As<Napi::Number>().FloatValue()));
+    }
+    Napi::Value Fmod(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), gt_->fmod_(info[0].As<Napi::Number>().FloatValue()));
+    }
+
+    // ==================== New binary ====================
+    Napi::Value Maximum(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), gt_->maximum_(Extract(info[0])));
+    }
+    Napi::Value Minimum(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), gt_->minimum_(Extract(info[0])));
+    }
+
+    // ==================== Conv1d/ConvTranspose ====================
+    Napi::Value Conv1d(const Napi::CallbackInfo& info) {
+        GradPtr w = Extract(info[0]);
+        GradPtr b = nullptr;
+        if (!info[1].IsNull() && !info[1].IsUndefined()) b = Extract(info[1]);
+        int stride = info[2].As<Napi::Number>().Int32Value();
+        int pad = info[3].As<Napi::Number>().Int32Value();
+        int dil = info[4].As<Napi::Number>().Int32Value();
+        int groups = info[5].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), gt_->conv1d_(w, b, stride, pad, dil, groups));
+    }
+    Napi::Value ConvTranspose1d(const Napi::CallbackInfo& info) {
+        GradPtr w = Extract(info[0]);
+        GradPtr b = nullptr;
+        if (!info[1].IsNull() && !info[1].IsUndefined()) b = Extract(info[1]);
+        int stride = info[2].As<Napi::Number>().Int32Value();
+        int pad = info[3].As<Napi::Number>().Int32Value();
+        int opad = info[4].As<Napi::Number>().Int32Value();
+        int dil = info[5].As<Napi::Number>().Int32Value();
+        int groups = info[6].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), gt_->conv_transpose1d_(w, b, stride, pad, opad, dil, groups));
+    }
+    Napi::Value ConvTranspose2d(const Napi::CallbackInfo& info) {
+        GradPtr w = Extract(info[0]);
+        GradPtr b = nullptr;
+        if (!info[1].IsNull() && !info[1].IsUndefined()) b = Extract(info[1]);
+        int sH = info[2].As<Napi::Number>().Int32Value();
+        int sW = info[3].As<Napi::Number>().Int32Value();
+        int pH = info[4].As<Napi::Number>().Int32Value();
+        int pW = info[5].As<Napi::Number>().Int32Value();
+        int opH = info[6].As<Napi::Number>().Int32Value();
+        int opW = info[7].As<Napi::Number>().Int32Value();
+        int dH = info[8].As<Napi::Number>().Int32Value();
+        int dW = info[9].As<Napi::Number>().Int32Value();
+        int groups = info[10].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), gt_->conv_transpose2d_(w, b, sH, sW, pH, pW, opH, opW, dH, dW, groups));
+    }
+
+    // ==================== Misc ops ====================
+    Napi::Value Embedding(const Napi::CallbackInfo& info) {
+        auto& indices = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>())->tensor_;
+        return Wrap(info.Env(), gt_->embedding_(indices));
+    }
+    Napi::Value Flip(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), gt_->flip_(info[0].As<Napi::Number>().Int32Value()));
+    }
+    Napi::Value Pad(const Napi::CallbackInfo& info) {
+        auto arr = info[0].As<Napi::Array>();
+        std::vector<int> padding;
+        for (uint32_t i = 0; i < arr.Length(); i++)
+            padding.push_back(((Napi::Value)arr[i]).As<Napi::Number>().Int32Value());
+        int mode = info.Length() > 1 ? info[1].As<Napi::Number>().Int32Value() : 0;
+        float val = info.Length() > 2 ? info[2].As<Napi::Number>().FloatValue() : 0.0f;
+        return Wrap(info.Env(), gt_->pad_(padding, mode, val));
+    }
+    Napi::Value Interpolate(const Napi::CallbackInfo& info) {
+        int target = info[0].As<Napi::Number>().Int32Value();
+        int mode = info.Length() > 1 ? info[1].As<Napi::Number>().Int32Value() : 0;
+        bool align = info.Length() > 2 ? info[2].As<Napi::Boolean>().Value() : false;
+        return Wrap(info.Env(), gt_->interpolate_(target, mode, align));
+    }
+    Napi::Value Cumsum(const Napi::CallbackInfo& info) {
+        return Wrap(info.Env(), gt_->cumsum_(info[0].As<Napi::Number>().Int32Value()));
+    }
+    Napi::Value FlattenGrad(const Napi::CallbackInfo& info) {
+        int start = info.Length() > 0 ? info[0].As<Napi::Number>().Int32Value() : 0;
+        int end = info.Length() > 1 ? info[1].As<Napi::Number>().Int32Value() : -1;
+        return Wrap(info.Env(), gt_->flatten_(start, end));
+    }
+    Napi::Value Max(const Napi::CallbackInfo& info) {
+        int dim = info[0].As<Napi::Number>().Int32Value();
+        bool keepdim = info.Length() > 1 ? info[1].As<Napi::Boolean>().Value() : false;
+        return Wrap(info.Env(), gt_->max_(dim, keepdim));
+    }
+    Napi::Value Min(const Napi::CallbackInfo& info) {
+        int dim = info[0].As<Napi::Number>().Int32Value();
+        bool keepdim = info.Length() > 1 ? info[1].As<Napi::Boolean>().Value() : false;
+        return Wrap(info.Env(), gt_->min_(dim, keepdim));
+    }
+    static Napi::Value CatGrad(const Napi::CallbackInfo& info) {
+        auto arr = info[0].As<Napi::Array>();
+        std::vector<GradPtr> tensors;
+        for (uint32_t i = 0; i < arr.Length(); i++)
+            tensors.push_back(Extract((Napi::Value)arr[i]));
+        int dim = info[1].As<Napi::Number>().Int32Value();
+        return Wrap(info.Env(), GradTensor::cat_(tensors, dim));
+    }
+
     // ==================== Static factories ====================
     static Napi::Value Randn(const Napi::CallbackInfo& info) {
         return Wrap(info.Env(), GradTensor::make(Tensor::randn(parseShape(info, 0))));
@@ -1181,6 +1340,11 @@ public:
             InstanceMethod("transpose", &CompiledGraphWrap::Transpose_),
             InstanceMethod("reshape", &CompiledGraphWrap::Reshape_),
             InstanceMethod("flatten", &CompiledGraphWrap::Flatten_),
+            // Misc
+            InstanceMethod("cat", &CompiledGraphWrap::Cat_),
+            InstanceMethod("slice", &CompiledGraphWrap::Slice_),
+            InstanceMethod("unsqueeze", &CompiledGraphWrap::Unsqueeze_),
+            InstanceMethod("squeeze", &CompiledGraphWrap::Squeeze_),
             // CNN
             InstanceMethod("conv2d", &CompiledGraphWrap::Conv2d_),
             InstanceMethod("max_pool2d", &CompiledGraphWrap::MaxPool2d_),
@@ -1293,6 +1457,33 @@ public:
         int a = info[0].As<Napi::Number>().Int32Value();
         int start_dim = info.Length() > 1 ? info[1].As<Napi::Number>().Int32Value() : 1;
         return Napi::Number::New(info.Env(), graph_.flatten(a, start_dim));
+    }
+
+    // Misc ops
+    Napi::Value Cat_(const Napi::CallbackInfo& info) {
+        auto arr = info[0].As<Napi::Array>();
+        std::vector<int> inputs;
+        for (uint32_t i = 0; i < arr.Length(); i++)
+            inputs.push_back(((Napi::Value)arr[i]).As<Napi::Number>().Int32Value());
+        int dim = info[1].As<Napi::Number>().Int32Value();
+        return Napi::Number::New(info.Env(), graph_.cat(inputs, dim));
+    }
+    Napi::Value Slice_(const Napi::CallbackInfo& info) {
+        int input = info[0].As<Napi::Number>().Int32Value();
+        int dim = info[1].As<Napi::Number>().Int32Value();
+        int start = info[2].As<Napi::Number>().Int32Value();
+        int end = info[3].As<Napi::Number>().Int32Value();
+        return Napi::Number::New(info.Env(), graph_.slice(input, dim, start, end));
+    }
+    Napi::Value Unsqueeze_(const Napi::CallbackInfo& info) {
+        int input = info[0].As<Napi::Number>().Int32Value();
+        int dim = info[1].As<Napi::Number>().Int32Value();
+        return Napi::Number::New(info.Env(), graph_.unsqueeze(input, dim));
+    }
+    Napi::Value Squeeze_(const Napi::CallbackInfo& info) {
+        int input = info[0].As<Napi::Number>().Int32Value();
+        int dim = info[1].As<Napi::Number>().Int32Value();
+        return Napi::Number::New(info.Env(), graph_.squeeze(input, dim));
     }
 
     // CNN ops
