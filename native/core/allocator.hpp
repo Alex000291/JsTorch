@@ -4,35 +4,32 @@
 #include <unordered_map>
 #include <cstdint>
 #include <stdexcept>
-#include <algorithm>
 
 namespace jstorch {
 
 // ==============================================================================
-// CudaAllocator: Size-binned O(1) sub-allocation with per-segment live tracking.
+// CudaAllocator: Size-binned O(1) sub-allocation.
 //
-// A CPU-side map (ptr_to_seg_) records which segment each allocation came from.
-// Each Segment tracks how many live user-held allocs it has.
-// trim() cudaFrees any segment whose live count is zero (all allocs returned to
-// bins), then clears the free lists so the next batch starts fresh.
+// - Pre-allocates large GPU segments (256MB default, grows as needed)
+// - Size-binned free lists: same-size allocs are O(1) pop/push
+// - No mutex (JS is single-threaded)
+// - trim(): cudaDeviceSynchronize + clear bins + reset bump.
+//   Called between benchmark batch sizes (after async yieldGC lets V8 GC
+//   collect dead wrappers and populate bins first).
+// - All allocations aligned to 512 bytes
 // ==============================================================================
 
 class CudaAllocator {
     static constexpr size_t ALIGNMENT    = 512;
     static constexpr size_t SEGMENT_SIZE = 256ULL * 1024 * 1024; // 256 MB
 
-    struct Segment {
-        void*    ptr  = nullptr;
-        size_t   size = 0;
-        uint32_t live = 0;   // live user-held allocs (not yet freed to bins)
-    };
-
-    std::vector<Segment>                               segments_;
-    std::unordered_map<size_t, std::vector<uintptr_t>> bins_;       // user_size → [ptr…]
-    std::unordered_map<uintptr_t, uint32_t>            ptr_to_seg_; // ptr → seg_idx
+    // Size-binned free lists: aligned_size → [ptr, ptr, ...]
+    std::unordered_map<size_t, std::vector<uintptr_t>> bins_;
+    // All segments (for cleanup at shutdown)
+    std::vector<void*> segments_;
+    // Current segment bump pointer
     uintptr_t bump_ptr_       = 0;
     size_t    bump_remaining_ = 0;
-    uint32_t  cur_seg_idx_    = 0;
 
     static size_t align_up(size_t n) {
         return (n + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
@@ -42,10 +39,10 @@ class CudaAllocator {
         size_t seg_size = (min_size > SEGMENT_SIZE)
                           ? align_up(min_size) : SEGMENT_SIZE;
         void* ptr = nullptr;
-        if (cudaMalloc(&ptr, seg_size) != cudaSuccess || !ptr)
+        cudaError_t err = cudaMalloc(&ptr, seg_size);
+        if (err != cudaSuccess || !ptr)
             throw std::runtime_error("cudaMalloc failed for segment");
-        cur_seg_idx_ = (uint32_t)segments_.size();
-        segments_.push_back({ptr, seg_size, 0});
+        segments_.push_back(ptr);
         bump_ptr_       = (uintptr_t)ptr;
         bump_remaining_ = seg_size;
     }
@@ -55,17 +52,12 @@ public:
         if (bytes == 0) bytes = ALIGNMENT;
         size_t size = align_up(bytes);
 
-        // O(1) reuse from bin
+        // O(1) reuse from size bin
         auto it = bins_.find(size);
         if (it != bins_.end() && !it->second.empty()) {
             uintptr_t addr = it->second.back();
             it->second.pop_back();
-            auto jt = ptr_to_seg_.find(addr);
-            if (jt != ptr_to_seg_.end()) {
-                segments_[jt->second].live++;
-                return (void*)addr;
-            }
-            // entry missing (shouldn't happen): fall through to bump
+            return (void*)addr;
         }
 
         // Bump allocate from current segment
@@ -73,8 +65,6 @@ public:
             add_segment(size);
 
         void* ptr = (void*)bump_ptr_;
-        ptr_to_seg_[(uintptr_t)ptr] = cur_seg_idx_;
-        segments_[cur_seg_idx_].live++;
         bump_ptr_       += size;
         bump_remaining_ -= size;
         return ptr;
@@ -83,56 +73,25 @@ public:
     void free(void* ptr, size_t bytes) {
         if (!ptr) return;
         size_t size = align_up(bytes);
-        auto it = ptr_to_seg_.find((uintptr_t)ptr);
-        if (it != ptr_to_seg_.end()) {
-            uint32_t sidx = it->second;
-            if (sidx < (uint32_t)segments_.size() && segments_[sidx].ptr != nullptr) {
-                // Segment still alive: decrement live count and return to bin.
-                // Keep ptr_to_seg_ entry — allocate() needs it when reusing from bins_.
-                segments_[sidx].live--;
-                bins_[size].push_back((uintptr_t)ptr);
-            } else {
-                // Segment was already cudaFree'd by trim(): clean up stale entry.
-                ptr_to_seg_.erase(it);
-            }
-        }
+        bins_[size].push_back((uintptr_t)ptr);
     }
 
-    // Release all GPU segments whose live count is zero.
-    // Should be called between benchmark batch sizes to reclaim VRAM.
+    // Discard all cached (freed) entries and reset the bump pointer.
+    // Call this between benchmark batch sizes, AFTER yielding to the event
+    // loop so V8 GC has had a chance to collect dead wrappers and return
+    // their GPU memory to bins_ first.
+    // Note: existing segments are NOT cudaFree'd here — live tensors (model
+    // parameters) still reference them.  They are freed at shutdown.
     void trim() {
         cudaDeviceSynchronize();
-
-        // Identify segments to free (live == 0 means all their allocs are in bins)
-        for (uint32_t i = 0; i < (uint32_t)segments_.size(); i++) {
-            if (!segments_[i].ptr || segments_[i].live != 0) continue;
-            // Remove ptr_to_seg_ entries and bin entries for this segment
-            for (auto& [sz, ptrs] : bins_) {
-                ptrs.erase(
-                    std::remove_if(ptrs.begin(), ptrs.end(),
-                        [&](uintptr_t p) {
-                            auto jt = ptr_to_seg_.find(p);
-                            if (jt != ptr_to_seg_.end() && jt->second == i) {
-                                ptr_to_seg_.erase(jt);
-                                return true;
-                            }
-                            return false;
-                        }),
-                    ptrs.end());
-            }
-            cudaFree(segments_[i].ptr);
-            segments_[i].ptr = nullptr;
-        }
-
         bins_.clear();
         bump_ptr_       = 0;
         bump_remaining_ = 0;
-        // Next allocate() will call add_segment() as needed.
     }
 
     ~CudaAllocator() {
-        for (auto& s : segments_)
-            if (s.ptr) cudaFree(s.ptr);
+        for (auto* p : segments_)
+            cudaFree(p);
     }
 };
 
@@ -143,6 +102,8 @@ inline CudaAllocator& get_allocator() {
 
 // ==============================================================================
 // ArenaAllocator: Bump allocator for CompiledGraph execution.
+// Zero overhead: O(1) allocate, no mutex, no free list.
+// Reset offset to 0 at start of each graph execution.
 // ==============================================================================
 class ArenaAllocator {
     static constexpr size_t ALIGNMENT = 512;

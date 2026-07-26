@@ -160,6 +160,7 @@ public: // data_ needs friend access from static methods
             InstanceMethod("conv_transpose1d", &TensorWrap::ConvTranspose1d),
             InstanceMethod("interpolate", &TensorWrap::Interpolate),
             InstanceMethod("randn_like", &TensorWrap::RandnLike),
+            InstanceMethod("linear", &TensorWrap::Linear_),
             InstanceMethod("conv2d", &TensorWrap::Conv2d_),
             InstanceMethod("conv_transpose2d", &TensorWrap::ConvTranspose2d_),
             InstanceMethod("avg_pool2d", &TensorWrap::AvgPool2d),
@@ -448,6 +449,17 @@ public: // data_ needs friend access from static methods
         return Wrap(info.Env(), tensor_.conv_transpose1d(w->tensor(), bias_ptr, stride, padding, output_padding, dilation, groups));
     }
     
+    // linear(weight, bias|null) — fused GEMM + bias in one N-API call
+    Napi::Value Linear_(const Napi::CallbackInfo& info) {
+        auto* w = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
+        const Tensor* bias_ptr = nullptr; Tensor bias_t(Shape{1});
+        if (!info[1].IsNull() && !info[1].IsUndefined()) {
+            bias_t = Napi::ObjectWrap<TensorWrap>::Unwrap(info[1].As<Napi::Object>())->tensor();
+            bias_ptr = &bias_t;
+        }
+        return Wrap(info.Env(), tensor_.linear(w->tensor(), bias_ptr));
+    }
+
     Napi::Value Conv2d_(const Napi::CallbackInfo& info) {
         auto* w = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
         const Tensor* bias_ptr = nullptr; Tensor bias_t(Shape{1});

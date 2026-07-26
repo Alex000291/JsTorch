@@ -4,6 +4,7 @@ export { Tensor, zeros, ones, randn, rand, tensor, cat, where,
          tril, triu } from './tensor.js';
 import native from './native.js';
 export const GradTensor = native.GradTensor;
+export const CompiledGraph = native.CompiledGraph;
 export { nn } from './nn.js';
 export { optim } from './optim.js';
 // Grad context — no-op (C++ autograd doesn't use global context)

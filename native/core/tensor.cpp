@@ -67,6 +67,7 @@ extern "C" {
     
     // Matmul
     void launch_matmul(const float*, const float*, float*, int, int, int, cudaStream_t);
+    void launch_linear(const float*, const float*, const float*, float*, int, int, int, cudaStream_t);
     void launch_bmm(const float*, const float*, float*, int, int, int, int, cudaStream_t);
     
     // Conv1d
@@ -650,6 +651,23 @@ Tensor Tensor::matmul(const Tensor& other) const {
         return r.squeeze(1);
     }
     throw std::runtime_error("matmul: unsupported dims");
+}
+
+// linear: self [B, in_f], weight [out_f, in_f], bias [out_f] → [B, out_f]
+// Fused GEMM + bias-add in one N-API call to minimize dispatch overhead.
+Tensor Tensor::linear(const Tensor& weight, const Tensor* bias) const {
+    if (ndim() != 2) throw std::runtime_error("linear: input must be 2D [B, in_f]");
+    if (weight.ndim() != 2) throw std::runtime_error("linear: weight must be 2D [out_f, in_f]");
+    int B    = shape_[0];
+    int in_f = shape_[1];
+    int out_f = weight.shape_[0];
+    if (weight.shape_[1] != in_f) throw std::runtime_error("linear: shape mismatch");
+    Tensor cx = contiguous(), cw = weight.contiguous();
+    Tensor r({B, out_f}, dtype_);
+    const float* b_ptr = bias ? bias->contiguous().data<float>() : nullptr;
+    launch_linear(cx.data<float>(), cw.data<float>(), b_ptr, r.data<float>(),
+                  B, in_f, out_f, 0);
+    return r;
 }
 
 // ==================== #17 embedding ====================

@@ -120,6 +120,9 @@ public:
     Tensor conv_transpose1d(const Tensor& weight, const Tensor* bias,
                             int stride, int padding, int output_padding, int dilation, int groups) const;
     
+    // Linear: fused matmul + bias (one N-API call)
+    Tensor linear(const Tensor& weight, const Tensor* bias) const;
+
     // Conv2d
     Tensor conv2d(const Tensor& weight, const Tensor* bias,
                   int sH, int sW, int pH, int pW, int dH, int dW, int groups) const;

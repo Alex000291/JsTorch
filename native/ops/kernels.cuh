@@ -40,20 +40,21 @@ void launch_unary(const float* input, float* output, int size, UnaryOp op, cudaS
 struct AbsOp { __device__ float operator()(float x) const { return fabsf(x); } };
 struct SqrtOp { __device__ float operator()(float x) const { return sqrtf(x); } };
 struct SquareOp { __device__ float operator()(float x) const { return x * x; } };
-struct ExpOp { __device__ float operator()(float x) const { return expf(x); } };
-struct LogOp { __device__ float operator()(float x) const { return logf(x); } };
-struct SinOp { __device__ float operator()(float x) const { return sinf(x); } };
-struct CosOp { __device__ float operator()(float x) const { return cosf(x); } };
-struct SigmoidOp { __device__ float operator()(float x) const { return 1.0f / (1.0f + expf(-x)); } };
-struct TanhOp { __device__ float operator()(float x) const { return tanhf(x); } };
-struct ReluOp { __device__ float operator()(float x) const { return fmaxf(0.0f, x); } };
-struct NegOp { __device__ float operator()(float x) const { return -x; } };
-struct FloorOp { __device__ float operator()(float x) const { return floorf(x); } };
-struct CeilOp { __device__ float operator()(float x) const { return ceilf(x); } };
-struct RoundOp { __device__ float operator()(float x) const { return roundf(x); } };
-struct SiluOp { __device__ float operator()(float x) const { return x / (1.0f + expf(-x)); } };
-struct GeluOp { __device__ float operator()(float x) const { return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x))); } };
-struct SoftplusOp { __device__ float operator()(float x) const { return x > 20.0f ? x : logf(1.0f + expf(x)); } };
+// __expf / __logf / __sinf / __cosf: fast intrinsics (~4 ULP error, ~2x faster than full-precision)
+struct ExpOp     { __device__ float operator()(float x) const { return __expf(x); } };
+struct LogOp     { __device__ float operator()(float x) const { return __logf(x); } };
+struct SinOp     { __device__ float operator()(float x) const { return __sinf(x); } };
+struct CosOp     { __device__ float operator()(float x) const { return __cosf(x); } };
+struct SigmoidOp { __device__ float operator()(float x) const { return 1.0f / (1.0f + __expf(-x)); } };
+struct TanhOp    { __device__ float operator()(float x) const { return tanhf(x); } };
+struct ReluOp    { __device__ float operator()(float x) const { return fmaxf(0.0f, x); } };
+struct NegOp     { __device__ float operator()(float x) const { return -x; } };
+struct FloorOp   { __device__ float operator()(float x) const { return floorf(x); } };
+struct CeilOp    { __device__ float operator()(float x) const { return ceilf(x); } };
+struct RoundOp   { __device__ float operator()(float x) const { return roundf(x); } };
+struct SiluOp    { __device__ float operator()(float x) const { return x / (1.0f + __expf(-x)); } };
+struct GeluOp    { __device__ float operator()(float x) const { return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x))); } };
+struct SoftplusOp{ __device__ float operator()(float x) const { return x > 20.0f ? x : __logf(1.0f + __expf(x)); } };
 
 struct Log1pOp { __device__ float operator()(float x) const { return log1pf(x); } };
 struct Atan2Op { __device__ float operator()(float x) const { return x; } }; // placeholder, atan2 is binary

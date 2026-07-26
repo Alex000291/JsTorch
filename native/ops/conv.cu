@@ -27,6 +27,7 @@ struct CudnnFwdCached {
     cudnnFilterDescriptor_t wDesc;
     cudnnConvolutionDescriptor_t convDesc;
     cudnnConvolutionFwdAlgo_t algo;
+    cudnnMathType_t math_type;   // must be set on convDesc before each forward call
     size_t ws_size;
 };
 
@@ -36,8 +37,10 @@ struct CudnnBwdCached {
     cudnnFilterDescriptor_t wDesc;
     cudnnConvolutionDescriptor_t convDesc;
     cudnnConvolutionBwdDataAlgo_t data_algo;
+    cudnnMathType_t data_math_type;
     size_t data_ws_size;
     cudnnConvolutionBwdFilterAlgo_t filter_algo;
+    cudnnMathType_t filter_math_type;
     size_t filter_ws_size;
 };
 
@@ -57,13 +60,22 @@ static CudnnFwdCached& get_fwd_cached(cudnnHandle_t handle, const ConvParams& p,
     cudnnSetFilter4dDescriptor(c.wDesc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, p.Co, p.Ci/p.groups, p.kH, p.kW);
     cudnnSetConvolution2dDescriptor(c.convDesc, p.pH, p.pW, p.sH, p.sW, p.dH, p.dW, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
     cudnnSetConvolutionGroupCount(c.convDesc, p.groups);
-    cudnnSetConvolutionMathType(c.convDesc, CUDNN_TENSOR_OP_MATH);
+    cudnnSetConvolutionMathType(c.convDesc, CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION);
     cudnnSetTensor4dDescriptor(c.yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, p.B, p.Co, Ho, Wo);
     cudnnSetTensor4dDescriptor(c.bDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, p.Co, 1, 1);
-    int count;
-    cudnnConvolutionFwdAlgoPerf_t perf;
-    cudnnGetConvolutionForwardAlgorithm_v7(handle, c.xDesc, c.wDesc, c.convDesc, c.yDesc, 1, &count, &perf);
-    c.algo = perf.algo; c.ws_size = 0;
+
+    // Heuristic algorithm selection — GET returns all algos sorted by estimated perf.
+    // Store both algo AND mathType: cuDNN 7.4+ requires cudnnSetConvolutionMathType(convDesc, perf.mathType)
+    // before each forward call to actually engage the right kernel (see PyTorch Conv_v7.cpp note).
+    const int MAX_ALGOS = 8;
+    cudnnConvolutionFwdAlgoPerf_t perfs[MAX_ALGOS];
+    int count = 0;
+    cudnnGetConvolutionForwardAlgorithm_v7(handle, c.xDesc, c.wDesc, c.convDesc, c.yDesc, MAX_ALGOS, &count, perfs);
+    int best = 0;
+    for (int i = 0; i < count; i++) { if (perfs[i].status == CUDNN_STATUS_SUCCESS) { best = i; break; } }
+    c.algo      = perfs[best].algo;
+    c.math_type = perfs[best].mathType;
+    c.ws_size = 0;
     cudnnGetConvolutionForwardWorkspaceSize(handle, c.xDesc, c.wDesc, c.convDesc, c.yDesc, c.algo, &c.ws_size);
     return cudnn_fwd_cache.emplace(p, c).first->second;
 }
@@ -81,17 +93,27 @@ static CudnnBwdCached& get_bwd_cached(cudnnHandle_t handle, const ConvParams& p,
     cudnnSetFilter4dDescriptor(c.wDesc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, p.Co, p.Ci/p.groups, p.kH, p.kW);
     cudnnSetConvolution2dDescriptor(c.convDesc, p.pH, p.pW, p.sH, p.sW, p.dH, p.dW, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
     cudnnSetConvolutionGroupCount(c.convDesc, p.groups);
-    cudnnSetConvolutionMathType(c.convDesc, CUDNN_TENSOR_OP_MATH);
+    cudnnSetConvolutionMathType(c.convDesc, CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION);
     cudnnSetTensor4dDescriptor(c.dyDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, p.B, p.Co, Ho, Wo);
     cudnnSetTensor4dDescriptor(c.dbDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, p.Co, 1, 1);
-    int count;
-    cudnnConvolutionBwdDataAlgoPerf_t dperf;
-    cudnnGetConvolutionBackwardDataAlgorithm_v7(handle, c.wDesc, c.dyDesc, c.convDesc, c.xDesc, 1, &count, &dperf);
-    c.data_algo = dperf.algo; c.data_ws_size = 0;
+
+    const int MAX_ALGOS = 8;
+    cudnnConvolutionBwdDataAlgoPerf_t dperfs[MAX_ALGOS];
+    cudnnConvolutionBwdFilterAlgoPerf_t fperfs[MAX_ALGOS];
+    int ret_d = 0, ret_f = 0;
+    cudnnGetConvolutionBackwardDataAlgorithm_v7(handle, c.wDesc, c.dyDesc, c.convDesc, c.xDesc, MAX_ALGOS, &ret_d, dperfs);
+    cudnnGetConvolutionBackwardFilterAlgorithm_v7(handle, c.xDesc, c.dyDesc, c.convDesc, c.wDesc, MAX_ALGOS, &ret_f, fperfs);
+
+    int best_d = 0, best_f = 0;
+    for (int i = 0; i < ret_d; i++) { if (dperfs[i].status == CUDNN_STATUS_SUCCESS) { best_d = i; break; } }
+    for (int i = 0; i < ret_f; i++) { if (fperfs[i].status == CUDNN_STATUS_SUCCESS) { best_f = i; break; } }
+    c.data_algo      = dperfs[best_d].algo;
+    c.data_math_type = dperfs[best_d].mathType;
+    c.data_ws_size = 0;
     cudnnGetConvolutionBackwardDataWorkspaceSize(handle, c.wDesc, c.dyDesc, c.convDesc, c.xDesc, c.data_algo, &c.data_ws_size);
-    cudnnConvolutionBwdFilterAlgoPerf_t fperf;
-    cudnnGetConvolutionBackwardFilterAlgorithm_v7(handle, c.xDesc, c.dyDesc, c.convDesc, c.wDesc, 1, &count, &fperf);
-    c.filter_algo = fperf.algo; c.filter_ws_size = 0;
+    c.filter_algo      = fperfs[best_f].algo;
+    c.filter_math_type = fperfs[best_f].mathType;
+    c.filter_ws_size = 0;
     cudnnGetConvolutionBackwardFilterWorkspaceSize(handle, c.xDesc, c.dyDesc, c.convDesc, c.wDesc, c.filter_algo, &c.filter_ws_size);
     return cudnn_bwd_cache.emplace(p, c).first->second;
 }
@@ -167,7 +189,10 @@ __global__ void add_bias_1d_kernel(float* output, const float* bias,
 
 static cublasHandle_t get_handle() {
     static cublasHandle_t h = nullptr;
-    if (!h) cublasCreate(&h);
+    if (!h) {
+        cublasCreate(&h);
+        cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
+    }
     return h;
 }
 
@@ -615,7 +640,10 @@ void launch_conv2d_cudnn(const float* input, const float* weight, const float* b
     
     ConvParams params{B,Ci,H,W,Co,kH,kW,sH,sW,pH,pW,dH,dW,groups};
     auto& c = get_fwd_cached(handle, params, Ho, Wo);
-    
+
+    // Must update mathType on convDesc before each call (PyTorch Conv_v7.cpp note)
+    cudnnSetConvolutionMathType(c.convDesc, c.math_type);
+
     float alpha = 1.0f, beta = 0.0f;
     cudnnConvolutionForward(handle, &alpha, c.xDesc, input, c.wDesc, weight, c.convDesc,
         c.algo, get_workspace(c.ws_size), c.ws_size, &beta, c.yDesc, output);
@@ -643,13 +671,17 @@ void launch_conv2d_backward_cudnn(
     ConvParams params{B,Ci,H,W,Co,kH,kW,sH,sW,pH,pW,dH,dW,groups};
     auto& c = get_bwd_cached(handle, params, Ho, Wo);
     float alpha = 1.0f, beta = 0.0f;
-    
-    if (grad_input)
+
+    if (grad_input) {
+        cudnnSetConvolutionMathType(c.convDesc, c.data_math_type);
         cudnnConvolutionBackwardData(handle, &alpha, c.wDesc, weight, c.dyDesc, grad_output,
             c.convDesc, c.data_algo, get_workspace(c.data_ws_size), c.data_ws_size, &beta, c.xDesc, grad_input);
-    if (grad_weight)
+    }
+    if (grad_weight) {
+        cudnnSetConvolutionMathType(c.convDesc, c.filter_math_type);
         cudnnConvolutionBackwardFilter(handle, &alpha, c.xDesc, input, c.dyDesc, grad_output,
             c.convDesc, c.filter_algo, get_workspace(c.filter_ws_size), c.filter_ws_size, &beta, c.wDesc, grad_weight);
+    }
     if (grad_bias)
         cudnnConvolutionBackwardBias(handle, &alpha, c.dyDesc, grad_output, &beta, c.dbDesc, grad_bias);
 }

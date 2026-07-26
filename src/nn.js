@@ -320,7 +320,9 @@ class MaxPool2d extends Module {
         this.pW = Array.isArray(padding) ? padding[1] : padding;
     }
     forward(x) {
-        return x.max_pool2d(this.kH, this.kW, this.sH, this.sW, this.pH, this.pW);
+        const r = x.max_pool2d(this.kH, this.kW, this.sH, this.sW, this.pH, this.pW);
+        // TensorWrap returns [output, indices]; GradTensorWrap returns a single GradTensor.
+        return Array.isArray(r) ? r[0] : r;
     }
 }
 
