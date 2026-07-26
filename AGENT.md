@@ -450,3 +450,46 @@ MSVC_PATH = C:\...\VS 2022 Community
   - LSTM: JsTorch 781us vs PyTorch 1928us = **2.5x faster**
   - MLP compiled: 86us vs PyTorch 714us = **8.3x faster**
 - **randn is slow** (~3ms for [512,784]): curand_normal per-element kernel. fromBuffer is 116us. Benchmark should avoid randn in hot loop.
+
+---
+
+## Tech Debt & Known Issues (updated 2026-07-26)
+
+### Dead code (safe to delete)
+1. **`native/audio/stft.cu`** (137 lines) — compiled but NO napi bindings, NO callers. Historical RVC audio placeholder. Delete + remove from `Makefile.js` cuda list.
+2. **`CompiledGraph::run_tape()`** in `autograd.hpp` (~500 lines, from line 1534) — replaced by `run()`. No callers anywhere. napi.cpp:1637 explicitly comments "Always use run()... run_tape is arena-based and requires fixed shape, so it's unsafe for varying B". Delete along with related caches (`tape_cache_`, `S_`, `G_`, `has_grad_`, `saved_`, `slots_allocated_`, `fwd_meta_`, `grad_meta_`, `save_meta_`, `arena_*`, `param_ptrs_`, `phase_`, `RunPhase` enum).
+3. **Handle API** (`native.H.*`, napi.cpp lines 1644–1823, ~180 lines) — 40+ functions (`H.randn`, `H.matmul`, `H.exp`, etc.) exposed but **zero callers** in `src/` or anywhere in repo. Old zero-overhead handle experiment. Delete `H_*` functions, `h_pool_`, `h_free_`, `InitHandleAPI`, and the exports.
+4. **`Tensor::split()`** in tensor.hpp/cpp — declared and implemented in C++ but never bound to napi. JS `Tensor.split` in tensor.js implements it via a JS loop of `.slice()`. Delete the C++ version.
+5. **Complex64 support** — `DType::Complex64` in dtype.hpp, plus `Tensor::real()/imag()/from_real_imag()` all throw `"Not implemented"`. `#include <cuComplex.h>` still there. Delete: remove `Complex64` enum value, delete 3 stub methods, remove complex handling in `dtype_size`/`dtype_name`, drop cuComplex include (except in stft.cu if kept). If audio path is truly gone, dtype becomes float32-only and can be simplified.
+6. **`src/index.d.ts`** — severely outdated (missing 90% of API: GradTensor, CompiledGraph, RNN/LSTM/GRU, Conv2d, BatchNorm, GroupNorm, LeakyReLU/GELU/SiLU, Embedding, ModuleList, most F.* functions, cat/where/stack/tril/triu, loadModel/saveModel, weight_norm). Either rewrite from scratch or delete.
+
+### Architectural bugs (cause benchmark failures)
+
+1. **`tensor.js` exported `cat`/`where` don't type-dispatch on GradTensor.**
+   - `export const cat = (t, dim) => Tensor.cat(t, dim)` — calls `native.Tensor.cat` which unwraps as `TensorWrap`. If passed GradTensor array (e.g. DenseNet's `cat(features, 1)`), wrong-type unwrap → fastfail crash (`0xC0000409`).
+   - Same issue for `where`, `stack`, `tril`, `triu`, and `Tensor.masked_fill` (uses `Tensor.where` on `this` which may be GradTensor).
+   - **Fix**: type-dispatch — if first tensor is `GradTensor`, dispatch to `native.GradTensor.cat/where` (cat exists; `where` needs new binding).
+   - **Impact**: densenet/googlenet js_eager crashes.
+
+2. **`nn.js::RNN` and `nn.js::LSTM` bypass autograd.**
+   - They call `Tensor.rnnForward(...)` directly, returning raw `Tensor` (no `.backward()` method). Training would fail on `.backward()`.
+   - `nn.js::GRU` avoids the problem by re-implementing GRU cell manually in JS — but that duplicates the cuDNN GRU already in `Tensor::rnn_forward`, and is very slow (per-timestep JS loop with `.slice()`/`.unsqueeze()`/`.matmul()`).
+   - **Fix**: Add `GradTensor.rnnForward` static in napi that wraps `Tensor::rnn_forward` + registers a multi-output backward via `Tensor::rnn_backward`. Then RNN/LSTM/GRU all use it and GRU's manual cell path can be deleted.
+   - **Impact**: rnn/lstm js_eager crash; GRU eager works but is slow.
+
+3. **`autograd.hpp::run()` missing `OpType::RNN_CUDNN` case** — FIXED in this session (added lines 1247+, needs build).
+   - **Impact**: rnn/gru/lstm/seq2seq js_compile crashed instantly. Fix pending build+test.
+
+### JS/C++ redundancy (candidates for fusion)
+
+1. **`optim.js::SGD` / `AdamW`** — momentum/state updates done in JS via ~5 N-API tensor ops per param per step. `Adam` already uses fused `native.Tensor.adamStep`. Fuse SGD and AdamW similarly (`launch_sgd_step`, `launch_adamw_step`).
+2. **`nn.js::LayerNorm` / `GroupNorm` / `BatchNorm`** — normalize via ~5 JS-level tensor ops. Could be single fused kernel (like PyTorch's `layer_norm`).
+3. **`nn.js::GRU._cell` + `_run_direction`** — full manual JS implementation. Delete once `GradTensor.rnnForward` exists.
+4. **`tensor.js::rand`** — uses `Math.random()` in JS loop then uploads. Should use `curand_uniform` on GPU (mirror of `randn`).
+5. **`tensor.js::linspace`** — JS loop + Float32Array upload. Could be `arange().mul_scalar().add_scalar()` chain.
+6. **`tensor.js::tril/triu`** — implemented via arange+mask+where (3 N-API calls, 3 GPU allocs). Could be single kernel.
+
+### Naming/organization nits
+- **`stft.cu`** namespace `jstorch::audio` — if kept, needs napi wiring; if not, delete entirely.
+- **`Tensor::split()`** removal simplifies header/impl.
+- **AGENT.md was written before** the Handle API and `run_tape` were dead-coded — this doc now reflects reality.

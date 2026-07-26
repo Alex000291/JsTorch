@@ -18,6 +18,7 @@ private:
 
 public:
     // Constructors
+    Tensor() : dtype_(DType::Float32), stream_(0), owns_stream_(false) {}
     explicit Tensor(const Shape& shape, DType dtype = DType::Float32);
     Tensor(std::shared_ptr<void> data, const Shape& shape, const Strides& strides,
            DType dtype, cudaStream_t stream);
@@ -35,7 +36,6 @@ public:
     template<typename T> const T* data() const { return static_cast<const T*>(data_.get()); }
     
     bool is_contiguous() const { return jstorch::is_contiguous(shape_, strides_); }
-    bool is_complex() const { return dtype_ == DType::Complex64; }
     
     // Copy
     Tensor clone() const;
@@ -49,13 +49,7 @@ public:
     Tensor transpose() const;
     Tensor transpose(int dim0, int dim1) const;
     Tensor slice(int dim, int start, int end) const;
-    std::vector<Tensor> split(int dim, int chunk_size) const;
     Tensor flatten(int start_dim, int end_dim) const;
-    
-    // Complex
-    Tensor real() const;
-    Tensor imag() const;
-    static Tensor from_real_imag(const Tensor& real, const Tensor& imag);
     
     // Binary ops (broadcast)
     Tensor add(const Tensor& other) const;
@@ -183,6 +177,10 @@ public:
     // Fused Adam optimizer step
     static void adam_step(Tensor& param, const Tensor& grad, Tensor& m, Tensor& v,
         float lr, float beta1, float beta2, float eps, float bc1, float bc2, float weight_decay);
+
+    // Release all cached GPU memory back to CUDA.
+    // Call between benchmark batch sizes to prevent VRAM exhaustion.
+    static void clear_cache();
 };
 
 }

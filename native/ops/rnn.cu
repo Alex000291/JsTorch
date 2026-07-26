@@ -64,11 +64,11 @@ static RNNPlan& get_or_create_plan(int mode, int B, int seq_len, int input_size,
         input_size, hidden_size, hidden_size, // projSize=hiddenSize (no projection)
         num_layers, nullptr, // no dropout
         CUDNN_RNN_PADDED_IO_ENABLED);
-    // if (st != CUDNN_STATUS_SUCCESS) printf("cudnnSetRNNDescriptor_v8: %d\n", st);
+    // if (st != CUDNN_STATUS_SUCCESS) fprintf(stderr, "[rnn] cudnnSetRNNDescriptor_v8 mode=%d failed: %d\n", mode, (int)st);
 
     // Build for this batch size
     st = cudnnBuildRNNDynamic(handle, p.rnnDesc, B);
-    // if (st != CUDNN_STATUS_SUCCESS) printf("cudnnBuildRNNDynamic: %d\n", st);
+    // if (st != CUDNN_STATUS_SUCCESS) fprintf(stderr, "[rnn] cudnnBuildRNNDynamic mode=%d failed: %d\n", mode, (int)st);
 
     // Data descriptors (batch-major: [B, seq_len, features])
     std::vector<int> seq_lengths(B, seq_len);
@@ -250,13 +250,17 @@ void launch_rnn_forward_cudnn(
 
     void* ws = get_workspace(plan.workspace_size);
 
+    // For non-LSTM modes (RNN_RELU, RNN_TANH, GRU), cDesc/cx/cy must be NULL.
+    // Passing non-null cy (even with null cx) causes CUDNN_STATUS_BAD_PARAM,
+    // which leaves reserve_space unpopulated and causes a crash in backward.
+    bool is_lstm = (mode == 2);
     cudnnRNNForward(handle, plan.rnnDesc,
         CUDNN_FWD_MODE_TRAINING,
         plan.dev_seq_lengths,
         plan.xDesc, x,
         plan.yDesc, y,
         plan.hDesc, hx, hy,
-        plan.cDesc, cx, cy,
+        is_lstm ? plan.cDesc : nullptr, is_lstm ? cx : nullptr, is_lstm ? cy : nullptr,
         plan.weight_space_size, plan.weight_space,
         plan.workspace_size, ws,
         plan.reserve_size, plan.reserve_space);
@@ -287,13 +291,16 @@ void launch_rnn_backward_cudnn(
 
     void* ws = get_workspace(plan.workspace_size);
 
+    // For non-LSTM modes, cDesc/cx/dcy/dcx must be NULL.
+    bool is_lstm = (mode == 2);
     // Backward data
     cudnnRNNBackwardData_v8(handle, plan.rnnDesc,
         plan.dev_seq_lengths,
         plan.yDesc, y, dy,
         plan.xDesc, dx,
         plan.hDesc, hx, dhy, dhx,
-        plan.cDesc, cx, dcy, dcx,
+        is_lstm ? plan.cDesc : nullptr, is_lstm ? cx : nullptr,
+        is_lstm ? dcy : nullptr, is_lstm ? dcx : nullptr,
         plan.weight_space_size, plan.weight_space,
         plan.workspace_size, ws,
         plan.reserve_size, plan.reserve_space);

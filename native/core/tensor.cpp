@@ -256,18 +256,6 @@ Tensor Tensor::slice(int dim, int start, int end) const {
     return Tensor(shared, ns, strides_, dtype_, stream_);
 }
 
-// #8: split
-std::vector<Tensor> Tensor::split(int dim, int chunk_size) const {
-    dim = normalize_axis(dim, ndim());
-    std::vector<Tensor> result;
-    int total = shape_[dim];
-    for (int s = 0; s < total; s += chunk_size) {
-        int e = std::min(s + chunk_size, total);
-        result.push_back(slice(dim, s, e));
-    }
-    return result;
-}
-
 // ==================== Unary ops ====================
 #define UNARY(name, launcher) \
 Tensor Tensor::name() const { \
@@ -1010,15 +998,15 @@ Tensor Tensor::conv_transpose2d_backward_weight(const Tensor& input, const Tenso
     return gw;
 }
 
-// Complex — not implemented for RVC
-Tensor Tensor::real() const { throw std::runtime_error("Not implemented"); }
-Tensor Tensor::imag() const { throw std::runtime_error("Not implemented"); }
-Tensor Tensor::from_real_imag(const Tensor&, const Tensor&) { throw std::runtime_error("Not implemented"); }
-
 void Tensor::adam_step(Tensor& param, const Tensor& grad, Tensor& m, Tensor& v,
     float lr, float beta1, float beta2, float eps, float bc1, float bc2, float weight_decay) {
     launch_adam_step(param.data<float>(), grad.data<float>(), m.data<float>(), v.data<float>(),
         lr, beta1, beta2, eps, bc1, bc2, weight_decay, param.size(), 0);
+}
+
+void Tensor::clear_cache() {
+    cudaDeviceSynchronize();  // wait for all GPU ops before freeing segments
+    get_allocator().trim();
 }
 
 }

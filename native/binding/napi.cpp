@@ -3,6 +3,8 @@
 #include "../core/autograd.hpp"
 #include <vector>
 
+
+
 using namespace jstorch;
 
 // Store both constructors
@@ -59,12 +61,22 @@ Shape parseShape(const Napi::CallbackInfo& info, int idx) {
 class TensorWrap : public Napi::ObjectWrap<TensorWrap> {
 public: // data_ needs friend access from static methods
     Tensor tensor_;
+    napi_env raw_env_ = nullptr;  // raw env for finalizer use
+    int64_t ext_bytes_ = 0;      // GPU bytes reported to V8 GC
 
     // Helper: wrap a C++ Tensor into a JS TensorWrap
     static Napi::Object Wrap(Napi::Env env, Tensor t) {
+        int64_t bytes = (int64_t)t.size() * 4;  // float32 = 4 bytes
         auto* refs = env.GetInstanceData<CtorRefs>();
         Napi::Object obj = refs->tensor_ctor.New({});
-        Napi::ObjectWrap<TensorWrap>::Unwrap(obj)->tensor_ = std::move(t);
+        auto* tw = Napi::ObjectWrap<TensorWrap>::Unwrap(obj);
+        tw->tensor_ = std::move(t);
+        tw->raw_env_ = env;
+        tw->ext_bytes_ = bytes;
+        if (bytes > 0) {
+            int64_t unused;
+            napi_adjust_external_memory(env, bytes, &unused);
+        }
         return obj;
     }
 
@@ -174,6 +186,7 @@ public: // data_ needs friend access from static methods
             StaticMethod("full", &TensorWrap::Full),
             StaticMethod("arange", &TensorWrap::Arange),
             StaticMethod("adamStep", &TensorWrap::AdamStep),
+            StaticMethod("clearCache", &TensorWrap::ClearCache),
         });
         
         auto* refs = env.GetInstanceData<CtorRefs>();
@@ -196,6 +209,13 @@ public: // data_ needs friend access from static methods
         }
     }
     
+    ~TensorWrap() {
+        if (ext_bytes_ > 0 && raw_env_) {
+            int64_t unused;
+            napi_adjust_external_memory(raw_env_, -ext_bytes_, &unused);
+        }
+    }
+
     Tensor& tensor() { return tensor_; }
 
     // ==================== Accessors ====================
@@ -717,17 +737,34 @@ public: // data_ needs friend access from static methods
             lr, beta1, beta2, eps, bc1, bc2, wd);
         return info.Env().Undefined();
     }
+
+    // clearCache(): cudaDeviceSynchronize then release all fully-unused GPU
+    // segments back to CUDA (segments still containing live tensor data are kept).
+    static Napi::Value ClearCache(const Napi::CallbackInfo& info) {
+        Tensor::clear_cache();
+        return info.Env().Undefined();
+    }
 };
 
 // ==================== GradTensorWrap ====================
 class GradTensorWrap : public Napi::ObjectWrap<GradTensorWrap> {
 public:
     GradPtr gt_;
+    napi_env raw_env_ = nullptr;  // raw env for finalizer use
+    int64_t ext_bytes_ = 0;      // GPU bytes reported to V8 GC
 
     static Napi::Object Wrap(Napi::Env env, GradPtr g) {
+        int64_t bytes = g ? (int64_t)g->data.size() * 4 : 0;
         auto* refs = env.GetInstanceData<CtorRefs>();
         Napi::Object obj = refs->grad_ctor.New({});
-        Napi::ObjectWrap<GradTensorWrap>::Unwrap(obj)->gt_ = std::move(g);
+        auto* gw = Napi::ObjectWrap<GradTensorWrap>::Unwrap(obj);
+        gw->gt_ = std::move(g);
+        gw->raw_env_ = env;
+        gw->ext_bytes_ = bytes;
+        if (bytes > 0) {
+            int64_t unused;
+            napi_adjust_external_memory(env, bytes, &unused);
+        }
         return obj;
     }
 
@@ -842,6 +879,7 @@ public:
 
             // Static
             StaticMethod("cat", &GradTensorWrap::CatGrad),
+            StaticMethod("rnnForward", &GradTensorWrap::RnnForward_),
             StaticMethod("randn", &GradTensorWrap::Randn),
             StaticMethod("zeros", &GradTensorWrap::Zeros),
             StaticMethod("ones", &GradTensorWrap::Ones),
@@ -867,6 +905,13 @@ public:
             gt_ = GradTensor::make(tw->tensor_, rg);
         } else {
             gt_ = GradTensor::make(Tensor({1}));
+        }
+    }
+
+    ~GradTensorWrap() {
+        if (ext_bytes_ > 0 && raw_env_) {
+            int64_t unused;
+            napi_adjust_external_memory(raw_env_, -ext_bytes_, &unused);
         }
     }
 
@@ -1270,6 +1315,138 @@ public:
         return info.Env().Undefined();
     }
 
+    // ==================== RNN forward with autograd ====================
+    static std::vector<GradPtr> extractGradArray(const Napi::Array& arr) {
+        std::vector<GradPtr> v;
+        for (uint32_t i = 0; i < arr.Length(); i++)
+            v.push_back(Extract(arr.Get(i)));
+        return v;
+    }
+
+    // rnnForward(x, hx_or_null, cx_or_null, wih[], whh[], bih[], bhh[], mode, hiddenSize, numLayers, bidir)
+    // Returns GradTensor array: [y, hy] for RNN/GRU, [y, hy, cy] for LSTM
+    static Napi::Value RnnForward_(const Napi::CallbackInfo& info) {
+        auto env = info.Env();
+
+        GradPtr gx = Extract(info[0]);
+
+        bool has_hx = !(info[1].IsNull() || info[1].IsUndefined());
+        GradPtr ghx = has_hx ? Extract(info[1]) : GradTensor::make(Tensor(), false);
+
+        bool has_cx = !(info[2].IsNull() || info[2].IsUndefined());
+        GradPtr gcx = has_cx ? Extract(info[2]) : nullptr;
+
+        auto gwih = extractGradArray(info[3].As<Napi::Array>());
+        auto gwhh = extractGradArray(info[4].As<Napi::Array>());
+        auto gbih = extractGradArray(info[5].As<Napi::Array>());
+        auto gbhh = extractGradArray(info[6].As<Napi::Array>());
+
+        int mode        = info[7].As<Napi::Number>().Int32Value();
+        int hidden_size = info[8].As<Napi::Number>().Int32Value();
+        int num_layers  = info[9].As<Napi::Number>().Int32Value();
+        int bidir       = info[10].As<Napi::Number>().Int32Value();
+        bool is_lstm    = (mode == 2);
+        int n           = (int)gwih.size();
+
+        std::vector<Tensor> wih_t, whh_t, bih_t, bhh_t;
+        for (auto& g : gwih) wih_t.push_back(g->data);
+        for (auto& g : gwhh) whh_t.push_back(g->data);
+        for (auto& g : gbih) bih_t.push_back(g->data);
+        for (auto& g : gbhh) bhh_t.push_back(g->data);
+
+        const Tensor* hx_raw = has_hx ? &ghx->data : nullptr;
+        const Tensor* cx_raw = (has_cx && gcx) ? &gcx->data : nullptr;
+
+        auto result = Tensor::rnn_forward(gx->data, hx_raw, cx_raw,
+            wih_t, whh_t, bih_t, bhh_t, mode, hidden_size, num_layers, bidir);
+
+        // Check if any input requires grad
+        bool need = gx->requires_grad || ghx->requires_grad;
+        if (has_cx && gcx) need = need || gcx->requires_grad;
+        for (auto& g : gwih) need = need || g->requires_grad;
+        for (auto& g : gwhh) need = need || g->requires_grad;
+        for (auto& g : gbih) need = need || g->requires_grad;
+        for (auto& g : gbhh) need = need || g->requires_grad;
+
+        if (!need) {
+            auto arr = Napi::Array::New(env, result.size());
+            for (uint32_t i = 0; i < (uint32_t)result.size(); i++)
+                arr.Set(i, Wrap(env, GradTensor::make(std::move(result[i]))));
+            return arr;
+        }
+
+        // Build shared backward context
+        struct RnnCtx {
+            Tensor x, y, hx, cx;
+            bool has_hx = false, has_cx = false;
+            std::vector<Tensor> wih_t, whh_t, bih_t, bhh_t;
+            int mode, hidden_size, num_layers, bidir;
+        };
+        auto ctx = std::make_shared<RnnCtx>();
+        ctx->x = gx->data;
+        ctx->y = result[0];   // shallow copy — shares GPU buffer
+        if (has_hx)           { ctx->hx = ghx->data; ctx->has_hx = true; }
+        if (has_cx && gcx)    { ctx->cx = gcx->data; ctx->has_cx = true; }
+        ctx->wih_t = std::move(wih_t);
+        ctx->whh_t = std::move(whh_t);
+        ctx->bih_t = std::move(bih_t);
+        ctx->bhh_t = std::move(bhh_t);
+        ctx->mode = mode; ctx->hidden_size = hidden_size;
+        ctx->num_layers = num_layers; ctx->bidir = bidir;
+
+        // Parents order matches rnn_backward output:
+        // [gx, ghx, (gcx for LSTM), gwih[0], gwhh[0], gbih[0], gbhh[0], ...]
+        std::vector<GradPtr> parents;
+        parents.push_back(gx);
+        parents.push_back(ghx);   // dummy (requires_grad=false) if h0 was null
+        if (is_lstm)
+            parents.push_back((has_cx && gcx) ? gcx : GradTensor::make(Tensor(), false));
+        for (int i = 0; i < n; i++) {
+            parents.push_back(gwih[i]);
+            parents.push_back(gwhh[i]);
+            parents.push_back(gbih[i]);
+            parents.push_back(gbhh[i]);
+        }
+
+        // grad_fn for y output: dy → run backward with dy, dhy=null
+        auto y_grad_fn = [ctx](const Tensor& dy) -> std::vector<Tensor> {
+            const Tensor* hxp = ctx->has_hx ? &ctx->hx : nullptr;
+            const Tensor* cxp = ctx->has_cx ? &ctx->cx : nullptr;
+            return Tensor::rnn_backward(ctx->x, hxp, cxp, ctx->y, dy, nullptr, nullptr,
+                ctx->wih_t, ctx->whh_t, ctx->bih_t, ctx->bhh_t,
+                ctx->mode, ctx->hidden_size, ctx->num_layers, ctx->bidir);
+        };
+        // grad_fn for hy output: dhy → run backward with dy=zeros, dhy
+        auto hy_grad_fn = [ctx](const Tensor& dhy) -> std::vector<Tensor> {
+            const Tensor* hxp = ctx->has_hx ? &ctx->hx : nullptr;
+            const Tensor* cxp = ctx->has_cx ? &ctx->cx : nullptr;
+            Tensor zeros_dy = Tensor::full(ctx->y.shape(), 0.f);
+            return Tensor::rnn_backward(ctx->x, hxp, cxp, ctx->y, zeros_dy, &dhy, nullptr,
+                ctx->wih_t, ctx->whh_t, ctx->bih_t, ctx->bhh_t,
+                ctx->mode, ctx->hidden_size, ctx->num_layers, ctx->bidir);
+        };
+
+        GradPtr gy  = GradTensor::make_with_grad(ctx->y,              y_grad_fn, parents);
+        GradPtr ghy = GradTensor::make_with_grad(std::move(result[1]), hy_grad_fn, parents);
+
+        auto out_arr = Napi::Array::New(env, is_lstm ? 3u : 2u);
+        out_arr.Set(0u, Wrap(env, gy));
+        out_arr.Set(1u, Wrap(env, ghy));
+
+        if (is_lstm) {
+            auto cy_grad_fn = [ctx](const Tensor& dcy) -> std::vector<Tensor> {
+                const Tensor* hxp = ctx->has_hx ? &ctx->hx : nullptr;
+                const Tensor* cxp = ctx->has_cx ? &ctx->cx : nullptr;
+                Tensor zeros_dy = Tensor::full(ctx->y.shape(), 0.f);
+                return Tensor::rnn_backward(ctx->x, hxp, cxp, ctx->y, zeros_dy, nullptr, &dcy,
+                    ctx->wih_t, ctx->whh_t, ctx->bih_t, ctx->bhh_t,
+                    ctx->mode, ctx->hidden_size, ctx->num_layers, ctx->bidir);
+            };
+            out_arr.Set(2u, Wrap(env, GradTensor::make_with_grad(std::move(result[2]), cy_grad_fn, parents)));
+        }
+        return out_arr;
+    }
+
     // Multi-tensor Adam: process all parameters in a batch
     static Napi::Value AdamStepMulti(const Napi::CallbackInfo& info) {
         Napi::Array params = info[0].As<Napi::Array>();
@@ -1633,200 +1810,19 @@ public:
             bufs_ptr = &bufs;
         }
 
-        graph_.run_tape(inp->tensor_, tgt->tensor_, params, ms, vs, lr, b1, b2, eps, bc1, bc2, wd, bufs_ptr);
+        // GradTensor-based run() — supports all ops and dynamic batch sizes.
+        graph_.run(inp->tensor_, tgt->tensor_, params, ms, vs, lr, b1, b2, eps, bc1, bc2, wd, bufs_ptr);
 
         return env.Undefined();
     }
 };
 
-// ==================== Handle API ====================
-// Zero-overhead tensor ops: no JS object creation, no unwrap/wrap.
-// Tensors live in a C++ vector, JS only sees integer handles.
-
-static std::vector<std::unique_ptr<Tensor>> h_pool_;  // slot 0 = sentinel
-static std::vector<int> h_free_;                       // free slot indices
-
-static int h_alloc(Tensor&& t) {
-    auto ptr = std::make_unique<Tensor>(std::move(t));
-    if (!h_free_.empty()) {
-        int id = h_free_.back();
-        h_free_.pop_back();
-        h_pool_[id] = std::move(ptr);
-        return id;
-    }
-    h_pool_.push_back(std::move(ptr));
-    return (int)h_pool_.size() - 1;
-}
-
-static inline Tensor& h_get(int id) { return *h_pool_[id]; }
-static inline int h_int(const Napi::CallbackInfo& info, int i) {
-    return info[i].As<Napi::Number>().Int32Value();
-}
-static inline float h_float(const Napi::CallbackInfo& info, int i) {
-    return info[i].As<Napi::Number>().FloatValue();
-}
-static inline Napi::Value h_ret(Napi::Env env, int id) {
-    return Napi::Number::New(env, id);
-}
-
-// --- Factory ---
-static Napi::Value H_randn(const Napi::CallbackInfo& info) {
-    Shape s = parseShape(info, 0);
-    return h_ret(info.Env(), h_alloc(Tensor::randn(s)));
-}
-static Napi::Value H_fromBuffer(const Napi::CallbackInfo& info) {
-    auto buf = info[0].As<Napi::Float32Array>();
-    Shape s = parseShape(info, 1);
-    Tensor t = Tensor::from_buffer(buf.Data(), buf.ElementLength(), s);
-    return h_ret(info.Env(), h_alloc(std::move(t)));
-}
-static Napi::Value H_free(const Napi::CallbackInfo& info) {
-    int id = h_int(info, 0);
-    if (id > 0 && id < (int)h_pool_.size() && h_pool_[id]) {
-        h_pool_[id].reset();  // destructor frees GPU memory, no new alloc
-        h_free_.push_back(id);
-    }
-    return info.Env().Undefined();
-}
-
-// --- Unary ops ---
-#define H_UNARY(JsName, Method) \
-static Napi::Value JsName(const Napi::CallbackInfo& info) { \
-    return h_ret(info.Env(), h_alloc(h_get(h_int(info, 0)).Method())); \
-}
-H_UNARY(H_exp, exp)   H_UNARY(H_log, log)     H_UNARY(H_sqrt, sqrt)
-H_UNARY(H_relu, relu) H_UNARY(H_sigmoid, sigmoid) H_UNARY(H_tanh, tanh)
-H_UNARY(H_neg, neg)   H_UNARY(H_abs, abs)     H_UNARY(H_sin, sin)
-H_UNARY(H_cos, cos)   H_UNARY(H_silu, silu)   H_UNARY(H_gelu, gelu)
-H_UNARY(H_square, square) H_UNARY(H_reciprocal, reciprocal)
-H_UNARY(H_softplus, softplus) H_UNARY(H_sign, sign) H_UNARY(H_log1p, log1p)
-
-// Parameterized unary
-static Napi::Value H_mul_scalar(const Napi::CallbackInfo& info) {
-    return h_ret(info.Env(), h_alloc(h_get(h_int(info, 0)).mul_scalar(h_float(info, 1))));
-}
-static Napi::Value H_add_scalar(const Napi::CallbackInfo& info) {
-    return h_ret(info.Env(), h_alloc(h_get(h_int(info, 0)).add_scalar(h_float(info, 1))));
-}
-static Napi::Value H_pow_scalar(const Napi::CallbackInfo& info) {
-    return h_ret(info.Env(), h_alloc(h_get(h_int(info, 0)).pow_scalar(h_float(info, 1))));
-}
-
-// --- Binary ops ---
-#define H_BINARY(JsName, Method) \
-static Napi::Value JsName(const Napi::CallbackInfo& info) { \
-    return h_ret(info.Env(), h_alloc(h_get(h_int(info, 0)).Method(h_get(h_int(info, 1))))); \
-}
-H_BINARY(H_add, add)  H_BINARY(H_sub, sub)  H_BINARY(H_mul, mul)
-H_BINARY(H_div, div)  H_BINARY(H_pow, pow)
-
-// --- Matmul ---
-static Napi::Value H_matmul(const Napi::CallbackInfo& info) {
-    return h_ret(info.Env(), h_alloc(h_get(h_int(info, 0)).matmul(h_get(h_int(info, 1)))));
-}
-
-// --- Reduce ---
-static Napi::Value H_sum(const Napi::CallbackInfo& info) {
-    int dim = info.Length() > 1 ? h_int(info, 1) : -1;
-    bool keepdim = info.Length() > 2 && info[2].As<Napi::Boolean>().Value();
-    return h_ret(info.Env(), h_alloc(h_get(h_int(info, 0)).sum(dim, keepdim)));
-}
-static Napi::Value H_mean(const Napi::CallbackInfo& info) {
-    int dim = info.Length() > 1 ? h_int(info, 1) : -1;
-    bool keepdim = info.Length() > 2 && info[2].As<Napi::Boolean>().Value();
-    return h_ret(info.Env(), h_alloc(h_get(h_int(info, 0)).mean(dim, keepdim)));
-}
-
-// --- View ---
-static Napi::Value H_transpose(const Napi::CallbackInfo& info) {
-    auto& t = h_get(h_int(info, 0));
-    if (info.Length() >= 3)
-        return h_ret(info.Env(), h_alloc(t.transpose(h_int(info, 1), h_int(info, 2))));
-    return h_ret(info.Env(), h_alloc(t.transpose()));
-}
-
-// --- Data access ---
-static Napi::Value H_toArray(const Napi::CallbackInfo& info) {
-    auto& t = h_get(h_int(info, 0));
-    auto data = t.to_array();
-    return buildNestedArray(info.Env(), data, t.shape(), 0, 0);
-}
-static Napi::Value H_shape(const Napi::CallbackInfo& info) {
-    auto& t = h_get(h_int(info, 0));
-    Napi::Env env = info.Env();
-    Napi::Array arr = Napi::Array::New(env, t.shape().size());
-    for (size_t i = 0; i < t.shape().size(); i++)
-        arr[i] = Napi::Number::New(env, t.shape()[i]);
-    return arr;
-}
-
-// --- Convert between Handle and TensorWrap ---
-static Napi::Value H_fromTensor(const Napi::CallbackInfo& info) {
-    auto* tw = Napi::ObjectWrap<TensorWrap>::Unwrap(info[0].As<Napi::Object>());
-    return h_ret(info.Env(), h_alloc(Tensor(tw->tensor_)));
-}
-static Napi::Value H_toTensor(const Napi::CallbackInfo& info) {
-    return TensorWrap::Wrap(info.Env(), h_get(h_int(info, 0)));
-}
-
-// --- Register all handle functions ---
-static void InitHandleAPI(Napi::Env env, Napi::Object exports) {
-    Napi::Object H = Napi::Object::New(env);
-    // Factory
-    H.Set("randn", Napi::Function::New(env, H_randn));
-    H.Set("fromBuffer", Napi::Function::New(env, H_fromBuffer));
-    H.Set("free", Napi::Function::New(env, H_free));
-    // Unary
-    H.Set("exp", Napi::Function::New(env, H_exp));
-    H.Set("log", Napi::Function::New(env, H_log));
-    H.Set("sqrt", Napi::Function::New(env, H_sqrt));
-    H.Set("relu", Napi::Function::New(env, H_relu));
-    H.Set("sigmoid", Napi::Function::New(env, H_sigmoid));
-    H.Set("tanh", Napi::Function::New(env, H_tanh));
-    H.Set("neg", Napi::Function::New(env, H_neg));
-    H.Set("abs", Napi::Function::New(env, H_abs));
-    H.Set("sin", Napi::Function::New(env, H_sin));
-    H.Set("cos", Napi::Function::New(env, H_cos));
-    H.Set("silu", Napi::Function::New(env, H_silu));
-    H.Set("gelu", Napi::Function::New(env, H_gelu));
-    H.Set("square", Napi::Function::New(env, H_square));
-    H.Set("reciprocal", Napi::Function::New(env, H_reciprocal));
-    H.Set("softplus", Napi::Function::New(env, H_softplus));
-    H.Set("sign", Napi::Function::New(env, H_sign));
-    H.Set("log1p", Napi::Function::New(env, H_log1p));
-    H.Set("mul_scalar", Napi::Function::New(env, H_mul_scalar));
-    H.Set("add_scalar", Napi::Function::New(env, H_add_scalar));
-    H.Set("pow_scalar", Napi::Function::New(env, H_pow_scalar));
-    // Binary
-    H.Set("add", Napi::Function::New(env, H_add));
-    H.Set("sub", Napi::Function::New(env, H_sub));
-    H.Set("mul", Napi::Function::New(env, H_mul));
-    H.Set("div", Napi::Function::New(env, H_div));
-    H.Set("pow", Napi::Function::New(env, H_pow));
-    // Matmul
-    H.Set("matmul", Napi::Function::New(env, H_matmul));
-    // Reduce
-    H.Set("sum", Napi::Function::New(env, H_sum));
-    H.Set("mean", Napi::Function::New(env, H_mean));
-    // View
-    H.Set("transpose", Napi::Function::New(env, H_transpose));
-    // Data
-    H.Set("toArray", Napi::Function::New(env, H_toArray));
-    H.Set("shape", Napi::Function::New(env, H_shape));
-    // Convert
-    H.Set("fromTensor", Napi::Function::New(env, H_fromTensor));
-    H.Set("toTensor", Napi::Function::New(env, H_toTensor));
-
-    exports.Set("H", H);
-}
+// (Handle API removed — was zero-overhead experiment, no callers.)
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
-    h_pool_.reserve(1024);
-    h_pool_.push_back(nullptr); // slot 0 = sentinel
     TensorWrap::Init(env, exports);
     GradTensorWrap::Init(env, exports);
     CompiledGraphWrap::Init(env, exports);
-    InitHandleAPI(env, exports);
     return exports;
 }
 

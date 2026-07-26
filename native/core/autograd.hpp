@@ -893,35 +893,7 @@ class CompiledGraph {
     std::vector<int> buffer_slots_;
     std::vector<std::pair<int,int>> carry_pairs_;  // {from_slot, to_slot} at end of each iteration
     int loop_iter_ = 0;  // current loop iteration index
-
-    // Tape cache (built once, reused across run_tape calls)
-    struct TapeEntry { OpType type; int16_t out, in0, in1, in2, in3; float fparam; int iparams[8]; };
-    std::vector<TapeEntry> tape_cache_;
-    bool tape_built_ = false;
-    // Pre-allocated buffers for run_tape (avoid per-call allocation)
-    std::vector<Tensor> S_, G_;
-    std::vector<bool> has_grad_;
-    std::vector<Tensor> saved_;
-    bool slots_allocated_ = false;
-
-    // === Static Memory + CUDA Graph ===
-    struct SlotMeta { Shape shape; int ndim; int total; size_t bytes; size_t offset; };
-    std::vector<SlotMeta> fwd_meta_;   // forward slot metadata
-    std::vector<SlotMeta> grad_meta_;  // grad slot metadata
-    std::vector<SlotMeta> save_meta_;  // saved tensor metadata
-    
-    void* arena_ = nullptr;
-    size_t arena_fwd_end_ = 0;    // end of forward region
-    size_t arena_grad_end_ = 0;   // end of grad region  
-    size_t arena_save_end_ = 0;   // end of saved region
-    size_t arena_size_ = 0;
-    
-    // param device pointers (baked during profile)
-    std::vector<float*> param_ptrs_;
-    
-    // TODO: CUDA Graph (requires all ops to use configurable stream)
-    
-    enum RunPhase { PHASE_PROFILE, PHASE_ARENA } phase_ = PHASE_PROFILE;
+    std::vector<std::vector<int>> cat_inputs_;  // per-CAT input slot lists (supports >8 inputs)
 
     // RNN_CUDNN op descriptor
     struct RNNCudnnOp {
@@ -1041,13 +1013,14 @@ public:
         return o;
     }
 
-    // Cat: concatenate multiple slots along dim. slots stored in iparams, count in fparam
+    // Cat: concatenate multiple slots along dim. slot list stored in cat_inputs_ (no 8-input limit)
     int cat(const std::vector<int>& inputs, int dim) {
         int o = alloc();
+        int cat_idx = (int)cat_inputs_.size();
+        cat_inputs_.push_back(inputs);
         TracedOp op{OpType::CAT, (int16_t)o, -1, -1, -1, -1, (float)dim, {}};
-        for (int i = 0; i < (int)inputs.size() && i < 8; i++) op.iparams[i] = inputs[i];
-        // Store count in in0
-        op.in0 = (int16_t)inputs.size();
+        op.iparams[0] = cat_idx;  // index into cat_inputs_
+        op.in0 = (int16_t)inputs.size();  // count (informational)
         ops_.push_back(op);
         return o;
     }
@@ -1085,6 +1058,22 @@ public:
     int num_params() const { return (int)param_slots_.size(); }
 
     int num_buffers() const { return (int)buffer_slots_.size(); }
+
+    // Check if graph contains ops requiring GradTensor autograd path
+    bool uses_gradtensor_ops() const {
+        for (const auto& op : ops_) {
+            switch (op.type) {
+                case OpType::CAT:
+                case OpType::SLICE:
+                case OpType::UNSQUEEZE:
+                case OpType::SQUEEZE:
+                case OpType::BATCH_NORM2D:
+                    return true;
+                default: break;
+            }
+        }
+        return false;
+    }
 
     // Execute forward + backward, write gradients back into param tensors
     void run(const Tensor& input, const Tensor& target,
@@ -1175,9 +1164,9 @@ public:
                 }
                 // Misc
                 case OpType::CAT: {
-                    int count = op.in0;
+                    auto& cat_in = cat_inputs_[op.iparams[0]];
                     std::vector<GradPtr> tensors;
-                    for (int i = 0; i < count; i++) tensors.push_back(slots[op.iparams[i]]);
+                    for (int s : cat_in) tensors.push_back(slots[s]);
                     int dim = (int)op.fparam;
                     slots[op.out] = GradTensor::cat_(tensors, dim);
                     break;
@@ -1230,6 +1219,171 @@ public:
                     auto centered = x->sub_(m);
                     auto vstd = v->add_scalar_(eps)->sqrt_()->reciprocal_();
                     slots[op.out] = centered->mul_(vstd)->mul_(g)->add_(b);
+                    break;
+                }
+                case OpType::RNN_CUDNN: {
+                    auto& rop = rnn_ops_[op.iparams[0]];
+                    auto& x_p = slots[rop.x_slot];
+                    GradPtr hx_p = (rop.hx_slot >= 0) ? slots[rop.hx_slot] : nullptr;
+                    GradPtr cx_p = (rop.cx_slot >= 0) ? slots[rop.cx_slot] : nullptr;
+                    std::vector<GradPtr> ws_ih, ws_hh, bs_ih, bs_hh;
+                    for (int s : rop.wih_slots) ws_ih.push_back(slots[s]);
+                    for (int s : rop.whh_slots) ws_hh.push_back(slots[s]);
+                    for (int s : rop.bih_slots) bs_ih.push_back(slots[s]);
+                    for (int s : rop.bhh_slots) bs_hh.push_back(slots[s]);
+
+                    std::vector<Tensor> wih_d, whh_d, bih_d, bhh_d;
+                    wih_d.reserve(ws_ih.size()); whh_d.reserve(ws_hh.size());
+                    bih_d.reserve(bs_ih.size()); bhh_d.reserve(bs_hh.size());
+                    for (auto& p : ws_ih) wih_d.push_back(p->data);
+                    for (auto& p : ws_hh) whh_d.push_back(p->data);
+                    for (auto& p : bs_ih) bih_d.push_back(p->data);
+                    for (auto& p : bs_hh) bhh_d.push_back(p->data);
+                    const Tensor* hx_dp = hx_p ? &hx_p->data : nullptr;
+                    const Tensor* cx_dp = cx_p ? &cx_p->data : nullptr;
+
+                    auto res = Tensor::rnn_forward(x_p->data, hx_dp, cx_dp,
+                        wih_d, whh_d, bih_d, bhh_d,
+                        rop.mode, rop.hidden_size, rop.num_layers, rop.bidirectional);
+
+                    bool need_grad = x_p->requires_grad
+                        || (hx_p && hx_p->requires_grad)
+                        || (cx_p && cx_p->requires_grad);
+                    for (auto& p : ws_ih) need_grad = need_grad || p->requires_grad;
+                    for (auto& p : ws_hh) need_grad = need_grad || p->requires_grad;
+                    for (auto& p : bs_ih) need_grad = need_grad || p->requires_grad;
+                    for (auto& p : bs_hh) need_grad = need_grad || p->requires_grad;
+
+                    if (!need_grad) {
+                        slots[rop.y_slot]  = GradTensor::make(std::move(res[0]));
+                        slots[rop.hy_slot] = GradTensor::make(std::move(res[1]));
+                        slots[rop.cy_slot] = GradTensor::make(res.size() > 2 ? std::move(res[2]) : Tensor({1}));
+                        break;
+                    }
+
+                    // Multi-output autograd: cache accumulates dy/dhy/dcy across output nodes;
+                    // last visited output actually runs Tensor::rnn_backward.
+                    struct RnnBackCache {
+                        Tensor sx, sy, shx, scx;
+                        bool has_hx = false, has_cx = false;
+                        std::vector<Tensor> wih, whh, bih, bhh;
+                        int mode = 0, hidden = 0, layers = 0, bidir = 0;
+                        Shape sy_shape, shy_shape, scy_shape;
+                        Tensor dy, dhy, dcy;
+                        bool has_dy = false, has_dhy = false, has_dcy = false;
+                        int expected_calls = 0;
+                        int received_calls = 0;
+                        std::vector<Tensor> parent_grads;
+                        bool computed = false;
+                    };
+                    auto cache = std::make_shared<RnnBackCache>();
+                    cache->sx = x_p->data;
+                    cache->sy = res[0];
+                    cache->sy_shape = res[0].shape();
+                    if (hx_dp) { cache->shx = *hx_dp; cache->has_hx = true; }
+                    if (cx_dp) { cache->scx = *cx_dp; cache->has_cx = true; }
+                    cache->wih = std::move(wih_d);
+                    cache->whh = std::move(whh_d);
+                    cache->bih = std::move(bih_d);
+                    cache->bhh = std::move(bhh_d);
+                    cache->mode = rop.mode; cache->hidden = rop.hidden_size;
+                    cache->layers = rop.num_layers; cache->bidir = rop.bidirectional;
+                    cache->shy_shape = res[1].shape();
+                    cache->scy_shape = (res.size() > 2) ? res[2].shape() : Shape{1};
+
+                    // Determine which outputs are actually used downstream — only used ones will
+                    // get their grad_fn called, so expected_calls must match.
+                    auto used_downstream = [&](int slot) -> bool {
+                        if (slot < 0) return false;
+                        if (slot == output_slot_) return true;
+                        for (int ip2 = ip + 1; ip2 < (int)ops_.size(); ip2++) {
+                            auto& o2 = ops_[ip2];
+                            if (o2.in0 == slot || o2.in1 == slot || o2.in2 == slot || o2.in3 == slot) return true;
+                            if (o2.type == OpType::CAT) {
+                                int cnt = o2.in0;
+                                for (int k = 0; k < cnt && k < 8; k++) if (o2.iparams[k] == slot) return true;
+                            }
+                            if (o2.type == OpType::RNN_CUDNN) {
+                                auto& r2 = rnn_ops_[o2.iparams[0]];
+                                if (r2.x_slot == slot || r2.hx_slot == slot || r2.cx_slot == slot) return true;
+                                for (int s : r2.wih_slots) if (s == slot) return true;
+                                for (int s : r2.whh_slots) if (s == slot) return true;
+                                for (int s : r2.bih_slots) if (s == slot) return true;
+                                for (int s : r2.bhh_slots) if (s == slot) return true;
+                            }
+                        }
+                        return false;
+                    };
+                    bool y_used  = used_downstream(rop.y_slot);
+                    bool hy_used = used_downstream(rop.hy_slot);
+                    bool cy_used = (res.size() > 2) && used_downstream(rop.cy_slot);
+                    cache->expected_calls = (int)y_used + (int)hy_used + (int)cy_used;
+                    if (cache->expected_calls == 0) cache->expected_calls = 1;
+
+                    // Parent list — order must match how compute_backward emits grads.
+                    std::vector<GradPtr> parents;
+                    parents.push_back(x_p);
+                    if (hx_p) parents.push_back(hx_p);
+                    if (cx_p) parents.push_back(cx_p);
+                    for (auto& p : ws_ih) parents.push_back(p);
+                    for (auto& p : ws_hh) parents.push_back(p);
+                    for (auto& p : bs_ih) parents.push_back(p);
+                    for (auto& p : bs_hh) parents.push_back(p);
+
+                    auto compute_backward = [cache]() {
+                        if (cache->computed) return;
+                        cache->computed = true;
+                        Tensor dy = cache->has_dy ? cache->dy : Tensor::full(cache->sy_shape, 0.f);
+                        // dhy/dcy: pass if available, regardless of whether hx/cx were provided.
+                        // cuDNN accepts null dhy/dcy (treats as zero grad for that output).
+                        const Tensor* dhy_ptr = cache->has_dhy ? &cache->dhy : nullptr;
+                        const Tensor* dcy_ptr = cache->has_dcy ? &cache->dcy : nullptr;
+                        const Tensor* hx_ptr = cache->has_hx ? &cache->shx : nullptr;
+                        const Tensor* cx_ptr = cache->has_cx ? &cache->scx : nullptr;
+                        auto grads = Tensor::rnn_backward(cache->sx, hx_ptr, cx_ptr, cache->sy,
+                            dy, dhy_ptr, dcy_ptr,
+                            cache->wih, cache->whh, cache->bih, cache->bhh,
+                            cache->mode, cache->hidden, cache->layers, cache->bidir);
+                        // tensor.cpp::rnn_backward result layout:
+                        //   Non-LSTM: [dx, dhx, dwih_0, dwhh_0, dbih_0, dbhh_0, ... (per layer)]
+                        //   LSTM:     [dx, dhx, dcx, dwih_0, dwhh_0, dbih_0, dbhh_0, ...]
+                        // Weight grads start at index 2 (non-LSTM) or 3 (LSTM).
+                        cache->parent_grads.clear();
+                        cache->parent_grads.push_back(std::move(grads[0]));  // dx
+                        if (cache->has_hx) cache->parent_grads.push_back(std::move(grads[1]));  // dhx
+                        if (cache->has_cx) cache->parent_grads.push_back(std::move(grads[2]));  // dcx (LSTM only)
+                        int nl = cache->layers * (cache->bidir ? 2 : 1);
+                        // Weight grads base: 2 for non-LSTM (no dcx slot), 3 for LSTM
+                        int wt_base = (cache->mode == 2) ? 3 : 2;
+                        // Collect all dwih first, then all dwhh, then all dbih, then all dbhh
+                        // to match parents order.
+                        for (int l = 0; l < nl; l++) cache->parent_grads.push_back(grads[wt_base + l * 4 + 0]); // wih
+                        for (int l = 0; l < nl; l++) cache->parent_grads.push_back(grads[wt_base + l * 4 + 1]); // whh
+                        for (int l = 0; l < nl; l++) cache->parent_grads.push_back(grads[wt_base + l * 4 + 2]); // bih
+                        for (int l = 0; l < nl; l++) cache->parent_grads.push_back(grads[wt_base + l * 4 + 3]); // bbh
+                    };
+
+                    auto make_gradfn = [cache, compute_backward](int idx) {
+                        return [cache, compute_backward, idx](const Tensor& g) -> std::vector<Tensor> {
+                            if (idx == 0)      { cache->dy  = g; cache->has_dy  = true; }
+                            else if (idx == 1) { cache->dhy = g; cache->has_dhy = true; }
+                            else if (idx == 2) { cache->dcy = g; cache->has_dcy = true; }
+                            cache->received_calls++;
+                            if (cache->received_calls >= cache->expected_calls) {
+                                compute_backward();
+                                return cache->parent_grads;
+                            }
+                            return {};
+                        };
+                    };
+
+                    slots[rop.y_slot]  = GradTensor::make_with_grad(std::move(res[0]), make_gradfn(0), parents);
+                    slots[rop.hy_slot] = GradTensor::make_with_grad(std::move(res[1]), make_gradfn(1), parents);
+                    if (res.size() > 2) {
+                        slots[rop.cy_slot] = GradTensor::make_with_grad(std::move(res[2]), make_gradfn(2), parents);
+                    } else {
+                        slots[rop.cy_slot] = GradTensor::make(Tensor({1}));
+                    }
                     break;
                 }
                 // Loop
@@ -1296,9 +1450,9 @@ public:
                                     break;
                                 }
                                 case OpType::CAT: {
-                                    int count = lop.in0;
+                                    auto& cat_in_l = cat_inputs_[lop.iparams[0]];
                                     std::vector<GradPtr> tensors;
-                                    for (int i = 0; i < count; i++) tensors.push_back(slots[lop.iparams[i]]);
+                                    for (int s : cat_in_l) tensors.push_back(slots[s]);
                                     int dim = (int)lop.fparam;
                                     slots[lop.out] = GradTensor::cat_(tensors, dim);
                                     break;
@@ -1341,608 +1495,6 @@ public:
         }
     }
 
-    ArenaAllocator arena_alloc_;
-
-    // ==================== Tape-based forward/backward ====================
-    // Zero GradTensor allocation — uses raw Tensor ops + analytical gradients.
-    // Phase 1 (first call): profile sizes, allocate arena
-    // Phase 2+: bump-allocate from arena (O(1) alloc, no mutex, no free list)
-    void run_tape(const Tensor& input, const Tensor& target,
-                  std::vector<Tensor>& params,
-                  std::vector<Tensor>& m_states, std::vector<Tensor>& v_states,
-                  float lr, float beta1, float beta2, float eps,
-                  float bc1, float bc2, float wd,
-                  std::vector<Tensor>* buffers = nullptr) {
-
-        int np = (int)params.size();
-        if (!slots_allocated_) {
-            Tensor dummy({1});
-            S_.assign(num_slots_, dummy);
-            G_.assign(num_slots_, dummy);
-            has_grad_.assign(num_slots_, false);
-            slots_allocated_ = true;
-        }
-        auto& S = S_; auto& G = G_; auto& has_grad = has_grad_;
-        std::fill(has_grad.begin(), has_grad.end(), false);
-        auto& saved = saved_;
-
-        // Arena mode: bump-allocate all intermediates, reset each call
-        arena_alloc_.reset();
-        active_arena = &arena_alloc_;
-
-        // Accumulate gradient into slot
-        auto accum = [&](int slot, Tensor g) {
-            if (has_grad[slot]) {
-                S[slot]; // ensure exists
-                G[slot] = G[slot].add(g);
-            } else {
-                G[slot] = std::move(g);
-                has_grad[slot] = true;
-            }
-        };
-
-        // Setup
-        S[input_slot_] = input;
-        if (target_slot_ >= 0) S[target_slot_] = target;
-        for (int i = 0; i < np; i++) S[param_slots_[i]] = params[i];
-        if (buffers) {
-            for (int i = 0; i < (int)buffer_slots_.size() && i < (int)buffers->size(); i++)
-                S[buffer_slots_[i]] = (*buffers)[i];
-        }
-
-        // ---- Build tape once (cached) ----
-        if (!tape_built_) {
-            tape_cache_.clear();
-            auto push_op = [](std::vector<TapeEntry>& tape, const TracedOp& op) {
-                TapeEntry e;
-                e.type = op.type; e.out = op.out; e.in0 = op.in0; e.in1 = op.in1;
-                e.in2 = op.in2; e.in3 = op.in3; e.fparam = op.fparam;
-                std::memcpy(e.iparams, op.iparams, sizeof(e.iparams));
-                tape.push_back(e);
-            };
-            for (int ip = 0; ip < (int)ops_.size(); ip++) {
-                auto& op = ops_[ip];
-                if (op.type == OpType::LOOP_BEGIN) {
-                    int num_iters = op.iparams[0];
-                    int loop_start = ip + 1;
-                    int loop_end_ip = loop_start;
-                    while (loop_end_ip < (int)ops_.size() && ops_[loop_end_ip].type != OpType::LOOP_END)
-                        loop_end_ip++;
-                    for (int iter = 0; iter < num_iters; iter++) {
-                        for (int j = loop_start; j < loop_end_ip; j++) {
-                            auto& lop = ops_[j];
-                            if (lop.type == OpType::LOOP_SLICE) {
-                                TapeEntry e;
-                                e.type = OpType::LOOP_SLICE; e.out = lop.out; e.in0 = lop.in0;
-                                e.in1 = -1; e.in2 = -1; e.in3 = -1; e.fparam = 0;
-                                std::memset(e.iparams, 0, sizeof(e.iparams));
-                                e.iparams[0] = lop.iparams[0];
-                                e.iparams[1] = iter;
-                                tape_cache_.push_back(e);
-                            } else {
-                                push_op(tape_cache_, lop);
-                            }
-                        }
-                        for (auto& [from, to] : carry_pairs_) {
-                            TapeEntry e;
-                            e.type = OpType::LOOP_END; e.out = (int16_t)to; e.in0 = (int16_t)from;
-                            e.in1 = -1; e.in2 = -1; e.in3 = -1; e.fparam = 0;
-                            std::memset(e.iparams, 0, sizeof(e.iparams));
-                            tape_cache_.push_back(e);
-                        }
-                    }
-                    ip = loop_end_ip;
-                } else if (op.type == OpType::LOOP_SLICE || op.type == OpType::LOOP_END) {
-                } else {
-                    push_op(tape_cache_, op);
-                }
-            }
-            tape_built_ = true;
-        }
-        auto& tape = tape_cache_;
-
-        // Execute forward tape
-        saved.clear();
-        saved.reserve(tape.size()); // upper bound
-        for (auto& e : tape) {
-            auto& a = S[e.in0];
-            switch (e.type) {
-                case OpType::RELU:
-                    S[e.out] = a.relu();
-                    saved.push_back(a); // need input for backward
-                    break;
-                case OpType::EXP:
-                    S[e.out] = a.exp();
-                    saved.push_back(S[e.out]); // need output
-                    break;
-                case OpType::LOG:
-                    S[e.out] = a.log();
-                    saved.push_back(a);
-                    break;
-                case OpType::SQRT:
-                    S[e.out] = a.sqrt();
-                    saved.push_back(S[e.out]);
-                    break;
-                case OpType::SQUARE:
-                    S[e.out] = a.square();
-                    saved.push_back(a);
-                    break;
-                case OpType::NEG:
-                    S[e.out] = a.neg();
-                    break;
-                case OpType::ABS:
-                    S[e.out] = a.abs();
-                    saved.push_back(a);
-                    break;
-                case OpType::SIGMOID:
-                    S[e.out] = a.sigmoid();
-                    saved.push_back(S[e.out]);
-                    break;
-                case OpType::TANH:
-                    S[e.out] = a.tanh();
-                    saved.push_back(S[e.out]);
-                    break;
-                case OpType::SILU:
-                    S[e.out] = a.silu();
-                    saved.push_back(a);
-                    break;
-                case OpType::GELU:
-                    S[e.out] = a.gelu();
-                    saved.push_back(a);
-                    break;
-                case OpType::SOFTPLUS:
-                    S[e.out] = a.softplus();
-                    saved.push_back(S[e.out]);
-                    break;
-                case OpType::RECIPROCAL:
-                    S[e.out] = a.reciprocal();
-                    saved.push_back(S[e.out]);
-                    break;
-                case OpType::SIGN:
-                    S[e.out] = a.sign();
-                    break;
-                case OpType::LOG1P:
-                    S[e.out] = a.log1p();
-                    saved.push_back(a);
-                    break;
-                case OpType::SIN:
-                    S[e.out] = a.sin();
-                    saved.push_back(a);
-                    break;
-                case OpType::COS:
-                    S[e.out] = a.cos();
-                    saved.push_back(a);
-                    break;
-                case OpType::POW_SCALAR:
-                    S[e.out] = a.pow_scalar(e.fparam);
-                    saved.push_back(a);
-                    break;
-                case OpType::MUL_SCALAR:
-                    S[e.out] = a.mul_scalar(e.fparam);
-                    break;
-                case OpType::ADD_SCALAR:
-                    S[e.out] = a.add_scalar(e.fparam);
-                    break;
-                case OpType::ADD:
-                    S[e.out] = a.add(S[e.in1]);
-                    break;
-                case OpType::SUB:
-                    S[e.out] = a.sub(S[e.in1]);
-                    break;
-                case OpType::MUL:
-                    S[e.out] = a.mul(S[e.in1]);
-                    saved.push_back(a);
-                    saved.push_back(S[e.in1]);
-                    break;
-                case OpType::DIV:
-                    S[e.out] = a.div(S[e.in1]);
-                    saved.push_back(a);
-                    saved.push_back(S[e.in1]);
-                    break;
-                case OpType::POW:
-                    S[e.out] = a.pow(S[e.in1]);
-                    saved.push_back(a);
-                    saved.push_back(S[e.in1]);
-                    saved.push_back(S[e.out]);
-                    break;
-                case OpType::MATMUL:
-                    S[e.out] = a.matmul(S[e.in1]);
-                    saved.push_back(a);
-                    saved.push_back(S[e.in1]);
-                    break;
-                case OpType::SUM: {
-                    int dim = e.iparams[0], kd = e.iparams[1];
-                    S[e.out] = a.sum(dim, kd);
-                    break;
-                }
-                case OpType::MEAN: {
-                    int dim = e.iparams[0], kd = e.iparams[1];
-                    S[e.out] = a.mean(dim, kd);
-                    break;
-                }
-                case OpType::TRANSPOSE:
-                    S[e.out] = a.transpose();
-                    break;
-                case OpType::TRANSPOSE2:
-                    S[e.out] = a.transpose(e.iparams[0], e.iparams[1]);
-                    break;
-                case OpType::RESHAPE: {
-                    Shape s;
-                    for (int i = 0; i < 8 && e.iparams[i] != INT_MIN; i++) s.push_back(e.iparams[i]);
-                    int total = a.size(), known = 1, neg_idx = -1;
-                    for (int i = 0; i < (int)s.size(); i++) {
-                        if (s[i] == -1) neg_idx = i; else known *= s[i];
-                    }
-                    if (neg_idx >= 0) s[neg_idx] = total / known;
-                    S[e.out] = a.reshape(s);
-                    break;
-                }
-                case OpType::FLATTEN: {
-                    int start = e.iparams[0];
-                    Shape orig = a.shape();
-                    Shape ns;
-                    for (int i = 0; i < start; i++) ns.push_back(orig[i]);
-                    int flat = 1;
-                    for (int i = start; i < (int)orig.size(); i++) flat *= orig[i];
-                    ns.push_back(flat);
-                    S[e.out] = a.reshape(ns);
-                    break;
-                }
-                case OpType::CONV2D: {
-                    const Tensor* bias = e.in2 >= 0 ? &S[e.in2] : nullptr;
-                    S[e.out] = a.conv2d(S[e.in1], bias,
-                        e.iparams[0], e.iparams[1], e.iparams[2], e.iparams[3],
-                        e.iparams[4], e.iparams[5], e.iparams[6]);
-                    saved.push_back(a);
-                    saved.push_back(S[e.in1]);
-                    break;
-                }
-                case OpType::MAX_POOL2D: {
-                    auto [out, indices] = a.max_pool2d(e.iparams[0], e.iparams[1],
-                        e.iparams[2], e.iparams[3], e.iparams[4], e.iparams[5]);
-                    S[e.out] = std::move(out);
-                    saved.push_back(indices);
-                    break;
-                }
-                case OpType::AVG_POOL2D: {
-                    S[e.out] = a.avg_pool2d(e.iparams[0], e.iparams[1],
-                        e.iparams[2], e.iparams[3], e.iparams[4], e.iparams[5], e.iparams[6]);
-                    break;
-                }
-                case OpType::BATCH_NORM2D: {
-                    // BN: (x - mean) / sqrt(var + eps) * gamma + beta
-                    auto& rmean = S[e.in1]; auto& rvar = S[e.in2];
-                    auto& gamma = S[e.in3]; auto& beta  = S[(int)e.fparam]; // fparam holds beta slot cast
-                    // Actually, let's check how BN is stored...
-                    // For now, just do forward like the GradTensor version
-                    // TODO: tape BN backward
-                    float bneps = *(float*)&e.iparams[0]; // eps stored in iparams
-                    // This is complex, skip BN in tape mode for now
-                    break;
-                }
-                case OpType::LOOP_SLICE: {
-                    int dim = e.iparams[0], iter = e.iparams[1];
-                    S[e.out] = a.slice(dim, iter, iter + 1).squeeze(dim);
-                    break;
-                }
-                case OpType::LOOP_END: {
-                    // CARRY: copy from→to
-                    S[e.out] = S[e.in0];
-                    break;
-                }
-                case OpType::RNN_CUDNN: {
-                    auto& rop = rnn_ops_[e.iparams[0]];
-                    auto& x = S[rop.x_slot];
-                    const Tensor* hx = rop.hx_slot >= 0 ? &S[rop.hx_slot] : nullptr;
-                    const Tensor* cx = rop.cx_slot >= 0 ? &S[rop.cx_slot] : nullptr;
-                    std::vector<Tensor> wih, whh, bih, bhh;
-                    for (int s : rop.wih_slots) wih.push_back(S[s]);
-                    for (int s : rop.whh_slots) whh.push_back(S[s]);
-                    for (int s : rop.bih_slots) bih.push_back(S[s]);
-                    for (int s : rop.bhh_slots) bhh.push_back(S[s]);
-                    auto result = Tensor::rnn_forward(x, hx, cx, wih, whh, bih, bhh,
-                        rop.mode, rop.hidden_size, rop.num_layers, rop.bidirectional);
-                    S[rop.y_slot] = std::move(result[0]);
-                    S[rop.hy_slot] = std::move(result[1]);
-                    if (result.size() > 2) S[rop.cy_slot] = std::move(result[2]);
-                    // Save for backward: x, hx, y, weights
-                    saved.push_back(x);
-                    saved.push_back(hx ? *hx : Tensor({1}));
-                    saved.push_back(cx ? *cx : Tensor({1}));
-                    saved.push_back(S[rop.y_slot]);
-                    break;
-                }
-                default: break;
-            }
-        }
-
-        // ---- Backward ----
-        has_grad[output_slot_] = true;
-        G[output_slot_] = Tensor::full(S[output_slot_].shape(), 1.0f);
-
-        int si = (int)saved.size(); // saved index, read backward
-
-        for (int i = (int)tape.size() - 1; i >= 0; i--) {
-            auto& e = tape[i];
-            if (!has_grad[e.out]) continue;
-            auto& g = G[e.out];
-
-            switch (e.type) {
-                case OpType::RELU: {
-                    auto& sx = saved[--si];
-                    accum(e.in0, g.mul(sx.gt(Tensor::full(sx.shape(), 0.f))));
-                    break;
-                }
-                case OpType::EXP: {
-                    auto& so = saved[--si];
-                    accum(e.in0, g.mul(so));
-                    break;
-                }
-                case OpType::LOG: {
-                    auto& sx = saved[--si];
-                    accum(e.in0, g.div(sx));
-                    break;
-                }
-                case OpType::SQRT: {
-                    auto& so = saved[--si];
-                    accum(e.in0, g.div(so.mul_scalar(2.f)));
-                    break;
-                }
-                case OpType::SQUARE: {
-                    auto& sx = saved[--si];
-                    accum(e.in0, g.mul(sx).mul_scalar(2.f));
-                    break;
-                }
-                case OpType::NEG:
-                    accum(e.in0, g.neg());
-                    break;
-                case OpType::ABS: {
-                    auto& sx = saved[--si];
-                    accum(e.in0, g.mul(sx.sign()));
-                    break;
-                }
-                case OpType::SIGMOID: {
-                    auto& so = saved[--si];
-                    accum(e.in0, g.mul(so).mul(so.neg().add_scalar(1.f)));
-                    break;
-                }
-                case OpType::TANH: {
-                    auto& so = saved[--si];
-                    accum(e.in0, g.mul(so.square().neg().add_scalar(1.f)));
-                    break;
-                }
-                case OpType::SILU: {
-                    auto& sx = saved[--si];
-                    Tensor sig = sx.sigmoid();
-                    accum(e.in0, g.mul(sig.add(sx.mul(sig).mul(sig.neg().add_scalar(1.f)))));
-                    break;
-                }
-                case OpType::GELU: {
-                    auto& sx = saved[--si];
-                    Tensor sig = sx.mul_scalar(1.702f).sigmoid();
-                    accum(e.in0, g.mul(sig.add(sx.mul_scalar(1.702f).mul(sig).mul(sig.neg().add_scalar(1.f)))));
-                    break;
-                }
-                case OpType::SOFTPLUS: {
-                    auto& so = saved[--si];
-                    accum(e.in0, g.mul(so.neg().exp().neg().add_scalar(1.f)));
-                    break;
-                }
-                case OpType::RECIPROCAL: {
-                    auto& so = saved[--si];
-                    accum(e.in0, g.neg().mul(so.square()));
-                    break;
-                }
-                case OpType::SIGN:
-                    // grad is zero
-                    break;
-                case OpType::LOG1P: {
-                    auto& sx = saved[--si];
-                    accum(e.in0, g.div(sx.add_scalar(1.f)));
-                    break;
-                }
-                case OpType::SIN: {
-                    auto& sx = saved[--si];
-                    accum(e.in0, g.mul(sx.cos()));
-                    break;
-                }
-                case OpType::COS: {
-                    auto& sx = saved[--si];
-                    accum(e.in0, g.mul(sx.sin().neg()));
-                    break;
-                }
-                case OpType::POW_SCALAR: {
-                    auto& sx = saved[--si];
-                    float ee = e.fparam;
-                    accum(e.in0, g.mul_scalar(ee).mul(sx.pow_scalar(ee - 1.f)));
-                    break;
-                }
-                case OpType::MUL_SCALAR:
-                    accum(e.in0, g.mul_scalar(e.fparam));
-                    break;
-                case OpType::ADD_SCALAR:
-                    accum(e.in0, g);
-                    break;
-                case OpType::ADD: {
-                    Shape sa = S[e.in0].shape(), sb = S[e.in1].shape();
-                    accum(e.in0, GradTensor::unbroadcast(g, sa));
-                    accum(e.in1, GradTensor::unbroadcast(g, sb));
-                    break;
-                }
-                case OpType::SUB: {
-                    Shape sa = S[e.in0].shape(), sb = S[e.in1].shape();
-                    accum(e.in0, GradTensor::unbroadcast(g, sa));
-                    accum(e.in1, GradTensor::unbroadcast(g.neg(), sb));
-                    break;
-                }
-                case OpType::MUL: {
-                    auto& sb = saved[--si]; auto& sa = saved[--si];
-                    Shape sha = sa.shape(), shb = sb.shape();
-                    accum(e.in0, GradTensor::unbroadcast(g.mul(sb), sha));
-                    accum(e.in1, GradTensor::unbroadcast(g.mul(sa), shb));
-                    break;
-                }
-                case OpType::DIV: {
-                    auto& sb = saved[--si]; auto& sa = saved[--si];
-                    Shape sha = sa.shape(), shb = sb.shape();
-                    accum(e.in0, GradTensor::unbroadcast(g.div(sb), sha));
-                    accum(e.in1, GradTensor::unbroadcast(g.mul(sa).neg().div(sb.square()), shb));
-                    break;
-                }
-                case OpType::POW: {
-                    auto& so = saved[--si]; auto& sb = saved[--si]; auto& sa = saved[--si];
-                    Shape sha = sa.shape(), shb = sb.shape();
-                    accum(e.in0, GradTensor::unbroadcast(g.mul(sb).mul(sa.pow(sb.add_scalar(-1.f))), sha));
-                    accum(e.in1, GradTensor::unbroadcast(g.mul(so).mul(sa.log()), shb));
-                    break;
-                }
-                case OpType::MATMUL: {
-                    auto& b = saved[--si]; auto& a = saved[--si];
-                    accum(e.in0, g.matmul(b.transpose()));
-                    accum(e.in1, a.transpose().matmul(g));
-                    break;
-                }
-                case OpType::SUM: {
-                    int dim = e.iparams[0], kd = e.iparams[1];
-                    Shape x_shape = S[e.in0].shape();
-                    int ndim = (int)x_shape.size();
-                    int nd = dim < 0 ? dim + ndim : dim;
-                    Tensor ge = g;
-                    if (!kd) { Shape s = x_shape; s[nd] = 1; ge = ge.reshape(s); }
-                    accum(e.in0, ge.add(Tensor::full(x_shape, 0.f)));
-                    break;
-                }
-                case OpType::MEAN: {
-                    int dim = e.iparams[0], kd = e.iparams[1];
-                    Shape x_shape = S[e.in0].shape();
-                    int ndim = (int)x_shape.size();
-                    int nd = dim < 0 ? dim + ndim : dim;
-                    int n = nd >= 0 ? x_shape[nd] : 1;
-                    for (auto d : x_shape) if (nd < 0) n = 1; // all-reduce handled by sum
-                    if (nd >= 0) n = x_shape[nd];
-                    Tensor ge = g.mul_scalar(1.f / n);
-                    if (!kd) { Shape s = x_shape; s[nd] = 1; ge = ge.reshape(s); }
-                    accum(e.in0, ge.add(Tensor::full(x_shape, 0.f)));
-                    break;
-                }
-                case OpType::TRANSPOSE:
-                    accum(e.in0, g.transpose());
-                    break;
-                case OpType::TRANSPOSE2:
-                    accum(e.in0, g.transpose(e.iparams[0], e.iparams[1]));
-                    break;
-                case OpType::RESHAPE:
-                case OpType::FLATTEN:
-                    accum(e.in0, g.reshape(S[e.in0].shape()));
-                    break;
-                case OpType::CONV2D: {
-                    auto& w = saved[--si]; auto& x = saved[--si];
-                    Shape xs = x.shape(), ws = w.shape();
-                    Tensor dx(xs), dw(ws);
-                    bool hb = e.in2 >= 0;
-                    if (hb) {
-                        Tensor db({ws[0]});
-                        Tensor::conv2d_backward_cudnn(x, w, g, dx, dw, &db,
-                            e.iparams[0], e.iparams[1], e.iparams[2], e.iparams[3],
-                            e.iparams[4], e.iparams[5], e.iparams[6]);
-                        accum(e.in2, db);
-                    } else {
-                        Tensor::conv2d_backward_cudnn(x, w, g, dx, dw, nullptr,
-                            e.iparams[0], e.iparams[1], e.iparams[2], e.iparams[3],
-                            e.iparams[4], e.iparams[5], e.iparams[6]);
-                    }
-                    accum(e.in0, dx);
-                    accum(e.in1, dw);
-                    break;
-                }
-                case OpType::MAX_POOL2D: {
-                    auto& indices = saved[--si];
-                    int B = S[e.in0].shape()[0], C = S[e.in0].shape()[1];
-                    int H = S[e.in0].shape()[2], W = S[e.in0].shape()[3];
-                    accum(e.in0, Tensor::maxpool2d_backward(g, indices, B, C, H, W));
-                    break;
-                }
-                case OpType::AVG_POOL2D: {
-                    int H = S[e.in0].shape()[2], W = S[e.in0].shape()[3];
-                    accum(e.in0, g.avgpool2d_backward(H, W,
-                        e.iparams[0], e.iparams[1], e.iparams[2], e.iparams[3],
-                        e.iparams[4], e.iparams[5], e.iparams[6]));
-                    break;
-                }
-                case OpType::LOOP_SLICE: {
-                    // backward of slice+squeeze: unsqueeze + pad with zeros via cat
-                    int dim = e.iparams[0], iter = e.iparams[1];
-                    Shape orig = S[e.in0].shape();
-                    Tensor gu = g.unsqueeze(dim); // undo squeeze
-                    std::vector<Tensor> parts;
-                    if (iter > 0) {
-                        Shape zs = orig; zs[dim] = iter;
-                        Tensor z(zs); cudaMemsetAsync(z.data<float>(), 0, z.size() * sizeof(float), 0);
-                        parts.push_back(std::move(z));
-                    }
-                    parts.push_back(gu.contiguous());
-                    int after = orig[dim] - iter - 1;
-                    if (after > 0) {
-                        Shape zs = orig; zs[dim] = after;
-                        Tensor z(zs); cudaMemsetAsync(z.data<float>(), 0, z.size() * sizeof(float), 0);
-                        parts.push_back(std::move(z));
-                    }
-                    Tensor dx = parts.size() == 1 ? parts[0] : Tensor::cat(parts, dim);
-                    accum(e.in0, dx);
-                    break;
-                }
-                case OpType::LOOP_END: {
-                    // CARRY backward: grad flows from to→from
-                    accum(e.in0, g);
-                    break;
-                }
-                case OpType::RNN_CUDNN: {
-                    auto& rop = rnn_ops_[e.iparams[0]];
-                    // Restore saved
-                    auto& saved_y = saved[--si];
-                    auto& saved_cx = saved[--si];
-                    auto& saved_hx = saved[--si];
-                    auto& saved_x = saved[--si];
-                    const Tensor* hx = rop.hx_slot >= 0 ? &saved_hx : nullptr;
-                    const Tensor* cx = rop.cx_slot >= 0 ? &saved_cx : nullptr;
-                    Tensor dy = has_grad[rop.y_slot] ? G[rop.y_slot] : Tensor::full(saved_y.shape(), 0.f);
-                    const Tensor* dhy = has_grad[rop.hy_slot] ? &G[rop.hy_slot] : nullptr;
-                    const Tensor* dcy = has_grad[rop.cy_slot] ? &G[rop.cy_slot] : nullptr;
-
-                    std::vector<Tensor> wih, whh, bih, bhh;
-                    for (int s : rop.wih_slots) wih.push_back(S[s]);
-                    for (int s : rop.whh_slots) whh.push_back(S[s]);
-                    for (int s : rop.bih_slots) bih.push_back(S[s]);
-                    for (int s : rop.bhh_slots) bhh.push_back(S[s]);
-
-                    auto result = Tensor::rnn_backward(saved_x, hx, cx, saved_y, dy, dhy, dcy,
-                        wih, whh, bih, bhh, rop.mode, rop.hidden_size, rop.num_layers, rop.bidirectional);
-                    // result: [dx, dhx, dcx, dwih_0, dwhh_0, dbih_0, dbhh_0, ...]
-                    accum(rop.x_slot, result[0]);
-                    if (rop.hx_slot >= 0) accum(rop.hx_slot, result[1]);
-                    if (rop.cx_slot >= 0) accum(rop.cx_slot, result[2]);
-                    int nl = rop.num_layers * (rop.bidirectional ? 2 : 1);
-                    for (int l = 0; l < nl; l++) {
-                        accum(rop.wih_slots[l], result[3 + l * 4]);
-                        accum(rop.whh_slots[l], result[4 + l * 4]);
-                        accum(rop.bih_slots[l], result[5 + l * 4]);
-                        accum(rop.bhh_slots[l], result[6 + l * 4]);
-                    }
-                    break;
-                }
-                default: break;
-            }
-        }
-
-        // ---- Adam step (outside arena — params are external Tensors) ----
-        active_arena = nullptr;
-        for (int i = 0; i < np; i++) {
-            if (!has_grad[param_slots_[i]]) continue;
-            Tensor::adam_step(params[i], G[param_slots_[i]], m_states[i], v_states[i],
-                              lr, beta1, beta2, eps, bc1, bc2, wd);
-        }
-
-    }
 };
 
 } // namespace jstorch

@@ -399,6 +399,11 @@ class RNN extends Module {
             bih.push(this._parameters[`bias_ih_l${l}`]);
             bhh.push(this._parameters[`bias_hh_l${l}`]);
         }
+        // Dispatch to GradTensor.rnnForward when training (any input/weight is GradTensor)
+        const isGrad = (x instanceof GradTensor) || wih.some(w => w instanceof GradTensor);
+        if (isGrad)
+            return GradTensor.rnnForward(x, h0, null, wih, whh, bih, bhh,
+                this.mode, this.hidden_size, this.num_layers, this.bidirectional ? 1 : 0);
         return Tensor.rnnForward(x, h0, null, wih, whh, bih, bhh,
             this.mode, this.hidden_size, this.num_layers, this.bidirectional ? 1 : 0);
     }
@@ -432,6 +437,10 @@ class LSTM extends Module {
             bih.push(this._parameters[`bias_ih_l${l}`]);
             bhh.push(this._parameters[`bias_hh_l${l}`]);
         }
+        const isGrad = (x instanceof GradTensor) || wih.some(w => w instanceof GradTensor);
+        if (isGrad)
+            return GradTensor.rnnForward(x, h0, c0, wih, whh, bih, bhh,
+                2, this.hidden_size, this.num_layers, this.bidirectional ? 1 : 0);
         return Tensor.rnnForward(x, h0, c0, wih, whh, bih, bhh,
             2, this.hidden_size, this.num_layers, this.bidirectional ? 1 : 0);
     }

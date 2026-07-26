@@ -12,6 +12,14 @@ process.env.PATH = dllDirs.join(';') + ';' + process.env.PATH;
 const native = require('../build/win/jstorch.node');
 
 // Scalar ops handled natively in napi.cpp — no JS override needed
+
+// Type-dispatch helpers: detect GradTensor inputs and route to the correct native class.
+// Fixes crash (0xC0000409) when models like DenseNet call cat(features, 1) on GradTensor arrays.
+const isGrad = (t) => t instanceof native.GradTensor;
+const anyGrad = (arr) => Array.isArray(arr) && arr.some(isGrad);
+// Unwrap: GradTensor → underlying native.Tensor (via .data getter); Tensor → itself
+const unwrap = (t) => (isGrad(t) ? t.data : t);
+
 export class Tensor extends native.Tensor {
     // === Factory ===
     static zeros(shape) {
@@ -36,9 +44,22 @@ export class Tensor extends native.Tensor {
         return native.Tensor.fromBuffer(new Float32Array(data), shape);
     }
     static cat(tensors, dim = 0) {
+        // Dispatch: if any tensor is GradTensor, use grad-aware cat
+        if (anyGrad(tensors)) {
+            // Promote raw Tensors to detached GradTensors so autograd sees a consistent array
+            const gs = tensors.map(t => isGrad(t) ? t : native.GradTensor.fromTensor(t, false));
+            return native.GradTensor.cat(gs, dim);
+        }
         return native.Tensor.cat(tensors, dim);
     }
     static where(cond, x, y) {
+        // GradTensor.where is not yet bound in C++; fall back to detached native op.
+        // NOTE: gradient does NOT flow through where in this path. Fine for inference /
+        // benchmarks; for training-graph masked_fill add a proper GradTensor.where binding.
+        if (isGrad(cond) || isGrad(x) || isGrad(y)) {
+            const r = native.Tensor.where(unwrap(cond), unwrap(x), unwrap(y));
+            return native.GradTensor.fromTensor(r, false);
+        }
         return native.Tensor.where(cond, x, y);
     }
     static fromIntArray(data, shape) {
@@ -174,7 +195,7 @@ export function tril(input, diagonal = 0) {
     const cols = native.Tensor.arange(0, W, 1).unsqueeze(0);
     const mask = rows.ge(cols.sub(diagonal));
     const z = native.Tensor.fromBuffer(new Float32Array(input.shape.reduce((a,b)=>a*b,1)), [...input.shape]);
-    return native.Tensor.where(mask, input, z);
+    return Tensor.where(mask, input, z);  // route through dispatcher for GradTensor support
 }
 
 export function triu(input, diagonal = 0) {
@@ -183,5 +204,5 @@ export function triu(input, diagonal = 0) {
     const cols = native.Tensor.arange(0, W, 1).unsqueeze(0);
     const mask = rows.le(cols.sub(diagonal));
     const z = native.Tensor.fromBuffer(new Float32Array(input.shape.reduce((a,b)=>a*b,1)), [...input.shape]);
-    return native.Tensor.where(mask, input, z);
+    return Tensor.where(mask, input, z);  // route through dispatcher for GradTensor support
 }
